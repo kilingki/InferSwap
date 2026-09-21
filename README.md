@@ -6,8 +6,6 @@ Load and unload are not caller APIs. Seamless does not mean switching is free. I
 
 InferSwap does not own runtime processes. Containers, dependencies, and real load/unload belong to each model project. InferSwap talks to them through a shared control contract.
 
-If documents conflict: `local/PRINCIPLES.md` wins on purpose; `local/InferSwap_implementation_blueprint.md` wins on behavior.
-
 ## Status (v0)
 
 v0 is a small server that proves request routing, FIFO wait, exclusive swap, cancellation, and busy protection against mock models A and B. There is no real VRAM accounting, no multi-model residency, and no vLLM / llama.cpp connection yet.
@@ -41,9 +39,4 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-## Docs
-
-- Purpose and constraints: [`local/PRINCIPLES.md`](local/PRINCIPLES.md)
-- Implementation spec: [`local/InferSwap_implementation_blueprint.md`](local/InferSwap_implementation_blueprint.md)
-- What the current code is: [`local/v0.md`](local/v0.md)
-- Selected llama-swap provenance: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
+Selected llama-swap provenance is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
