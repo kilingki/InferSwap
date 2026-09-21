@@ -1,0 +1,28 @@
+listen: ":8080"
+logLevel: info
+healthCheckTimeout: 120
+unloadTimeout: 30
+queueTimeout: 180
+prepareTimeout: 60
+statusTimeout: 5
+drainTimeout: 180
+shutdownTimeout: 60
+maxQueueSize: 256
+preload: []
+
+models:
+  qwen3.8-27b:
+    baseURL: "http://127.0.0.1:8000"
+    name: "Qwen3.8 27B"
+    aliases: [qwen]
+    concurrencyLimit: 1
+    unlisted: false
+    prepare:
+      argv: ["/absolute/path/model-project/prepare-inferswap"]
+    timeouts:
+      prepareTimeout: 60
+      healthCheckTimeout: 120
+      unloadTimeout: 30
+  qwen-asr:
+    baseURL: "http://127.0.0.1:8001"
+    name: "Qwen ASR"
