@@ -66,7 +66,7 @@ func newClient(t *testing.T, s *mock.Server, model config.Model, opts ClientOpti
 	return c
 }
 
-func TestEnsureReadyWaitsForHealth200(t *testing.T) {
+func TestEnsureReadyFromStatus(t *testing.T) {
 	s, err := mock.New("A")
 	if err != nil {
 		t.Fatal(err)
@@ -79,13 +79,17 @@ func TestEnsureReadyWaitsForHealth200(t *testing.T) {
 	if c.State() != StateReady {
 		t.Fatalf("state=%s", c.State())
 	}
+	st := s.Snapshot()
+	if st.State != mock.StateReady || st.Residency != mock.ResidencyResident {
+		t.Fatalf("remote=%+v", st)
+	}
 	resp, err := http.Get(s.URL() + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("health=%d", resp.StatusCode)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("readiness must not depend on runtime /health")
 	}
 }
 
@@ -197,8 +201,8 @@ func TestEnsureReadyAfterStoppingLoads(t *testing.T) {
 	}
 }
 
-func TestHealthTimeoutDoesNotMarkReady(t *testing.T) {
-	s, err := mock.New("A", mock.WithHealthDelay())
+func TestLoadingDeadlineDoesNotMarkReady(t *testing.T) {
+	s, err := mock.New("A", mock.WithInitialLoading())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,28 +212,23 @@ func TestHealthTimeoutDoesNotMarkReady(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- c.EnsureReady(context.Background(), 0) }()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if s.Counts().HealthChecks >= 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	for i := 0; i < 4; i++ {
+		time.Sleep(20 * time.Millisecond)
+		clock.Advance(time.Second)
 	}
-	if s.Counts().HealthChecks < 1 {
-		t.Fatal("no health poll")
-	}
-	clock.Advance(3 * time.Second)
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("expected health timeout")
+			t.Fatal("expected ready deadline")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("EnsureReady hung")
 	}
 	if c.State() == StateReady {
-		t.Fatal("must not mark ready after health timeout")
+		t.Fatal("must not mark ready after status deadline")
+	}
+	if s.Counts().LoadStarts != 0 {
+		t.Fatal("joining an in-progress load must not start another")
 	}
 }
 
@@ -264,7 +263,7 @@ func TestUnknownDoesNotAssumeReadyOrStopped(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	s.SetStatusMode(mock.StatusUnknown)
+	s.SetStatusMode(mock.StatusReadyNotResident)
 	c := newClient(t, s, testModel(s.URL()), ClientOptions{})
 	err = c.EnsureReady(context.Background(), 0)
 	if err == nil {
@@ -278,7 +277,7 @@ func TestUnknownDoesNotAssumeReadyOrStopped(t *testing.T) {
 	}
 }
 
-func TestFailedDoesNotRetrySameLoadUntilUnloaded(t *testing.T) {
+func TestFailedNotResidentAllowsReload(t *testing.T) {
 	s, err := mock.New("A", mock.WithLoadFailure())
 	if err != nil {
 		t.Fatal(err)
@@ -291,19 +290,40 @@ func TestFailedDoesNotRetrySameLoadUntilUnloaded(t *testing.T) {
 	if s.Counts().LoadStarts != 1 {
 		t.Fatalf("starts=%d", s.Counts().LoadStarts)
 	}
-	if err := c.EnsureReady(context.Background(), 0); err == nil {
-		t.Fatal("expected failed remote state to block retry")
-	}
-	if s.Counts().LoadStarts != 1 {
-		t.Fatalf("retried load starts=%d", s.Counts().LoadStarts)
-	}
 	s.SetLoadFailure(false)
-	s.ForceUnloaded()
 	if err := c.EnsureReady(context.Background(), 0); err != nil {
 		t.Fatal(err)
 	}
 	if s.Counts().LoadStarts != 2 {
 		t.Fatalf("recovery load starts=%d", s.Counts().LoadStarts)
+	}
+	if c.State() != StateReady {
+		t.Fatalf("state=%s", c.State())
+	}
+}
+
+func TestFailedUnknownBlocksLoadAllowsRecoveryUnload(t *testing.T) {
+	s, err := mock.New("A", mock.WithLoadFailureUnknown())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c := newClient(t, s, testModel(s.URL()), ClientOptions{})
+	if err := c.EnsureReady(context.Background(), 0); err == nil {
+		t.Fatal("expected load failure")
+	}
+	if err := c.EnsureReady(context.Background(), 0); err == nil {
+		t.Fatal("failed+unknown must not load")
+	}
+	if s.Counts().LoadStarts != 1 {
+		t.Fatalf("load starts=%d", s.Counts().LoadStarts)
+	}
+	if err := c.Stop(context.Background(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	st := s.Snapshot()
+	if st.State != mock.StateUnloaded || st.Residency != mock.ResidencyNotResident || st.LastError != nil {
+		t.Fatalf("recovery=%+v", st)
 	}
 }
 
@@ -405,22 +425,26 @@ func TestPrepareUnavailable(t *testing.T) {
 	}
 }
 
-func TestStatusPreservesNulls(t *testing.T) {
+func TestStatusRejectsNullAndContradictions(t *testing.T) {
 	s, err := mock.New("A")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	c := newClient(t, s, testModel(s.URL()), ClientOptions{})
+	for _, mode := range []mock.StatusMode{mock.StatusNullActive, mock.StatusNegativeActive, mock.StatusMissingActive, mock.StatusReadyNotResident, mock.StatusMalformed} {
+		s.SetStatusMode(mode)
+		if _, err := c.Status(context.Background()); err == nil {
+			t.Fatalf("mode %d accepted", mode)
+		}
+	}
+	s.SetStatusMode(mock.StatusNormal)
 	st, err := c.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Resource.ObservedBytes != nil || st.Resource.Budget != nil || st.Resource.DeviceID != nil {
-		t.Fatalf("nulls coerced: %+v", st.Resource)
-	}
-	if st.ActiveRequests == nil || *st.ActiveRequests != 0 {
-		t.Fatalf("active=%v", st.ActiveRequests)
+	if st.State != WireUnloaded || st.Residency != ResidencyNotResident || st.ActiveRequests != 0 {
+		t.Fatalf("status=%+v", st)
 	}
 }
 
@@ -470,7 +494,7 @@ func TestCancelDoesNotAbortStartedLoad(t *testing.T) {
 	gate.Release()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if s.Counts().LoadEnds == 1 && s.Snapshot().ModelState == mock.StateReady {
+		if s.Counts().LoadEnds == 1 && s.Snapshot().State == mock.StateReady {
 			if c.State() != StateReady {
 				t.Fatalf("operation should finish ready, state=%s", c.State())
 			}
@@ -478,7 +502,7 @@ func TestCancelDoesNotAbortStartedLoad(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("started load did not finish: counts=%+v state=%s remote=%s", s.Counts(), c.State(), s.Snapshot().ModelState)
+	t.Fatalf("started load did not finish: counts=%+v state=%s remote=%s", s.Counts(), c.State(), s.Snapshot().State)
 }
 
 func TestPrepareTimeoutAndNoBlindRerun(t *testing.T) {
@@ -515,5 +539,11 @@ func TestPrepareTimeoutAndNoBlindRerun(t *testing.T) {
 	}
 	if rec.Runs() != 1 {
 		t.Fatalf("runs=%d", rec.Runs())
+	}
+	if err := c.EnsureReady(context.Background(), 0); err == nil {
+		t.Fatal("second prepare must wait for the first child")
+	}
+	if rec.Runs() != 1 {
+		t.Fatalf("rerun=%d", rec.Runs())
 	}
 }

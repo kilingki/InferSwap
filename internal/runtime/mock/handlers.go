@@ -20,34 +20,45 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	case StatusMalformed:
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"protocol_version":`))
+		_, _ = w.Write([]byte(`{"state":`))
 		return
-	case StatusUnknown:
-		st.ModelState = StateUnknown
-		st.Resident = nil
-		st.ActiveRequests = nil
-		st.InferenceReady = false
-		writeJSON(w, http.StatusOK, st)
+	case StatusUnreliable:
+		writeControlError(w, http.StatusInternalServerError, "status unavailable", "STATUS_FAILED")
+		return
+	case StatusNullActive:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"state":           "unloaded",
+			"residency":       "not_resident",
+			"active_requests": nil,
+			"last_error":      nil,
+		})
+		return
+	case StatusNegativeActive:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"state":           "ready",
+			"residency":       "resident",
+			"active_requests": -1,
+			"last_error":      nil,
+		})
+		return
+	case StatusMissingActive:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"state":      "unloaded",
+			"residency":  "not_resident",
+			"last_error": nil,
+		})
+		return
+	case StatusReadyNotResident:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"state":           "ready",
+			"residency":       "not_resident",
+			"active_requests": 0,
+			"last_error":      nil,
+		})
 		return
 	default:
 		writeJSON(w, http.StatusOK, st)
 	}
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeControlError(w, http.StatusMethodNotAllowed, "GET required", "BAD_REQUEST")
-		return
-	}
-	s.mu.Lock()
-	s.counts.HealthChecks++
-	ready := s.inferenceReady && !s.healthHeld
-	s.mu.Unlock()
-	if !ready {
-		writeControlError(w, http.StatusServiceUnavailable, "not ready", "NOT_READY")
-		return
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
@@ -61,11 +72,29 @@ func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if s.modelState == StateReady && s.inferenceReady && !s.healthHeld {
+	switch s.modelState {
+	case StateReady:
 		st := s.statusLocked()
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, st)
 		return
+	case StateUnloading:
+		s.mu.Unlock()
+		writeControlError(w, http.StatusConflict, "unload in progress", "LIFECYCLE_CONFLICT")
+		return
+	case StateFailed:
+		if s.residency != ResidencyNotResident {
+			s.mu.Unlock()
+			writeControlError(w, http.StatusConflict, "residency not clear", "LIFECYCLE_CONFLICT")
+			return
+		}
+	case StateLoading:
+		if s.loadCh != nil {
+			wait := s.loadCh
+			s.mu.Unlock()
+			s.waitAndWriteLoad(w, r, wait)
+			return
+		}
 	}
 	if s.loadCh != nil {
 		wait := s.loadCh
@@ -75,20 +104,18 @@ func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
 	}
 	s.counts.LoadStarts++
 	s.modelState = StateLoading
-	s.inferenceReady = false
+	s.residency = ResidencyUnknown
 	ch := make(chan struct{})
 	s.loadCh = ch
 	gate := s.loadGate
-	healthGate := s.healthGate
 	fail := s.loadFail
-	held := s.healthHeld
 	s.mu.Unlock()
 
-	go s.runLoad(ch, gate, healthGate, fail, held)
+	go s.runLoad(ch, gate, fail)
 	s.waitAndWriteLoad(w, r, ch)
 }
 
-func (s *Server) runLoad(done chan struct{}, gate, healthGate interface{ Hit(context.Context) error }, fail, healthHeld bool) {
+func (s *Server) runLoad(done chan struct{}, gate interface{ Hit(context.Context) error }, fail LoadFailMode) {
 	defer close(done)
 	if gate != nil {
 		_ = gate.Hit(context.Background())
@@ -98,17 +125,22 @@ func (s *Server) runLoad(done chan struct{}, gate, healthGate interface{ Hit(con
 	defer s.mu.Unlock()
 	s.counts.LoadEnds++
 	s.loadCh = nil
-	if fail {
+	switch fail {
+	case LoadFailNotResident:
 		s.modelState = StateFailed
-		s.inferenceReady = false
-		s.resident = boolPtr(false)
+		s.residency = ResidencyNotResident
+		s.active = 0
 		s.lastError = &LastError{Code: "LOAD_FAILED", Message: "load failed"}
+		return
+	case LoadFailUnknown:
+		s.modelState = StateFailed
+		s.residency = ResidencyUnknown
+		s.active = 0
+		s.lastError = &LastError{Code: "LOAD_FAILED", Message: "load failed after partial GPU allocation"}
 		return
 	}
 	s.modelState = StateReady
-	s.resident = boolPtr(true)
-	s.healthHeld = healthHeld
-	s.inferenceReady = true
+	s.residency = ResidencyResident
 	s.lastError = nil
 }
 
@@ -140,12 +172,27 @@ func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if s.busyLocked() {
+	if s.modelState == StateLoading {
 		s.mu.Unlock()
-		writeControlError(w, http.StatusConflict, "model is busy", "BUSY")
+		writeControlError(w, http.StatusConflict, "load in progress", "LIFECYCLE_CONFLICT")
 		return
 	}
-	if s.modelState == StateUnloaded && !s.inferenceReady {
+	if s.busyLocked() {
+		s.mu.Unlock()
+		writeControlError(w, http.StatusConflict, "runtime has active inference requests", "BUSY")
+		return
+	}
+	if s.modelState == StateUnloaded && s.residency == ResidencyNotResident {
+		st := s.statusLocked()
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, st)
+		return
+	}
+	if s.modelState == StateFailed && s.residency == ResidencyNotResident {
+		s.modelState = StateUnloaded
+		s.residency = ResidencyNotResident
+		s.active = 0
+		s.lastError = nil
 		st := s.statusLocked()
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, st)
@@ -159,7 +206,6 @@ func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.counts.UnloadStarts++
 	s.modelState = StateUnloading
-	s.inferenceReady = false
 	ch := make(chan struct{})
 	s.unloadCh = ch
 	gate := s.unloadGate
@@ -182,26 +228,19 @@ func (s *Server) runUnload(done chan struct{}, gate interface{ Hit(context.Conte
 	s.unloadCh = nil
 	if s.busyLocked() {
 		s.modelState = StateReady
-		s.inferenceReady = true
-		s.resident = boolPtr(true)
-		s.lastError = &LastError{Code: "BUSY", Message: "model is busy"}
+		s.residency = ResidencyResident
+		s.lastError = &LastError{Code: "BUSY", Message: "runtime has active inference requests"}
 		return
 	}
 	if fail {
 		s.modelState = StateFailed
-		s.inferenceReady = true
-		s.resident = boolPtr(true)
-		s.lastError = &LastError{Code: "UNLOAD_FAILED", Message: "unload failed"}
+		s.residency = ResidencyResident
+		s.lastError = &LastError{Code: "UNLOAD_FAILED", Message: "failed to release model"}
 		return
 	}
 	s.modelState = StateUnloaded
-	s.inferenceReady = false
-	s.resident = boolPtr(false)
-	if s.active == nil {
-		s.active = intPtr(0)
-	} else {
-		*s.active = 0
-	}
+	s.residency = ResidencyNotResident
+	s.active = 0
 	s.lastError = nil
 }
 
@@ -214,7 +253,7 @@ func (s *Server) waitAndWriteUnload(w http.ResponseWriter, r *http.Request, wait
 		st := s.statusLocked()
 		s.mu.Unlock()
 		if busy {
-			writeControlError(w, http.StatusConflict, "model is busy", "BUSY")
+			writeControlError(w, http.StatusConflict, "runtime has active inference requests", "BUSY")
 			return
 		}
 		if fail {
@@ -233,7 +272,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	if !s.inferenceReady {
+	if s.modelState != StateReady || s.residency != ResidencyResident {
 		s.mu.Unlock()
 		writeControlError(w, http.StatusServiceUnavailable, "not ready", "NOT_READY")
 		return
@@ -279,13 +318,4 @@ func (s *Server) finishInference(backend interface{ Hit(context.Context) error }
 	s.addActiveLocked(-1)
 	s.counts.InferEnds++
 	s.mu.Unlock()
-}
-
-func (s *Server) ReleaseHealth() {
-	s.mu.Lock()
-	s.healthHeld = false
-	s.mu.Unlock()
-	if s.healthGate != nil {
-		s.healthGate.Release()
-	}
 }

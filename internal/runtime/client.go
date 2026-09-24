@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,9 @@ type Client struct {
 	state   atomic.Value
 	handler atomic.Pointer[http.Handler]
 	gen     atomic.Uint64
+
+	prepMu   sync.Mutex
+	prepBusy bool
 }
 
 type ClientOptions struct {
@@ -322,50 +326,95 @@ func (c *Client) doEnsure(ctx context.Context) error {
 		}
 		return err
 	}
-	if st.ProtocolVersion != "" && st.ProtocolVersion != "v0" {
-		return fmt.Errorf("unsupported protocol_version %q", st.ProtocolVersion)
-	}
+	return c.ensureFromStatus(ctx, st)
+}
 
-	switch st.ModelState {
-	case "ready":
-		if err := c.waitHealth(ctx, c.clock.Now().Add(c.healthCheckTimeout)); err != nil {
+func (c *Client) ensureFromStatus(ctx context.Context, st Status) error {
+	switch st.State {
+	case WireReady:
+		return nil
+	case WireLoading:
+		return c.waitReady(ctx, c.clock.Now().Add(c.healthCheckTimeout))
+	case WireUnloading:
+		return fmt.Errorf("runtime is unloading")
+	case WireFailed:
+		if st.Residency == ResidencyNotResident && st.ActiveRequests == 0 {
+			break
+		}
+		return fmt.Errorf("remote state=failed residency=%s; refusing load", st.Residency)
+	case WireUnloaded:
+	default:
+		return fmt.Errorf("remote state=%s; refusing to assume ready or stopped", st.State)
+	}
+	deadline := c.clock.Now().Add(c.healthCheckTimeout)
+	st, err := c.postLoad(ctx, deadline)
+	if err != nil {
+		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
 			return err
 		}
-		return nil
-	case "loading":
-		return c.waitHealth(ctx, c.clock.Now().Add(c.healthCheckTimeout))
-	case "unloading":
-		return fmt.Errorf("runtime is unloading")
-	case "failed", "unknown":
-		if st.ModelState == "failed" || st.ModelState == "unknown" {
-			return fmt.Errorf("remote model_state=%s; refusing to assume ready or stopped", st.ModelState)
+		observed, ferr := c.fetchStatus(ctx)
+		if ferr != nil {
+			return err
 		}
+		if observed.State == WireReady {
+			return nil
+		}
+		if observed.State == WireLoading {
+			return c.waitReady(ctx, deadline)
+		}
+		if observed.State == WireFailed && observed.Residency == ResidencyNotResident && observed.ActiveRequests == 0 {
+			return fmt.Errorf("load failed: %s", lastCode(observed))
+		}
+		return fmt.Errorf("load not confirmed: state=%s residency=%s", observed.State, observed.Residency)
 	}
-
-	if err := c.postControl(ctx, "/control/load", c.healthCheckTimeout); err != nil {
-		return err
+	if st.State != WireReady || st.Residency != ResidencyResident {
+		return fmt.Errorf("load response is not ready/resident")
 	}
-	return c.waitHealth(ctx, c.clock.Now().Add(c.healthCheckTimeout))
+	return nil
 }
 
 func (c *Client) runPrepare(ctx context.Context) error {
+	c.prepMu.Lock()
+	if c.prepBusy {
+		c.prepMu.Unlock()
+		return fmt.Errorf("prepare still running")
+	}
 	if c.prepare == nil || len(c.prepare.Argv) == 0 {
+		c.prepMu.Unlock()
 		return ErrPrepareUnavailable
 	}
-	cwd := prepareCwd(c.prepare.Argv)
+	c.prepBusy = true
+	argv := append([]string{}, c.prepare.Argv...)
+	c.prepMu.Unlock()
+
+	cwd := prepareCwd(argv)
 	done := make(chan error, 1)
 	go func() {
-		done <- c.commander.Run(ctx, c.prepare.Argv, cwd)
+		done <- c.commander.Run(c.parent, argv, cwd)
 	}()
+	finish := func() {
+		c.prepMu.Lock()
+		c.prepBusy = false
+		c.prepMu.Unlock()
+	}
 	select {
 	case err := <-done:
+		finish()
 		if err != nil {
 			return fmt.Errorf("prepare failed: %w", err)
 		}
 		return nil
 	case <-c.clock.After(c.prepareTimeout):
+		go func() {
+			<-done
+			finish()
+		}()
 		return fmt.Errorf("prepare timed out after %s", c.prepareTimeout)
 	case <-ctx.Done():
+		go func() {
+			<-done
+			finish()
+		}()
 		return ctx.Err()
 	}
 }
@@ -373,20 +422,60 @@ func (c *Client) runPrepare(ctx context.Context) error {
 func (c *Client) doStop(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if err := c.postControl(ctx, "/control/unload", timeout); err != nil {
-		return err
-	}
 	st, err := c.fetchStatus(ctx)
 	if err != nil {
-		return fmt.Errorf("unload succeeded but status recheck failed: %w", err)
+		return err
 	}
-	if st.InferenceReady || (st.Resident != nil && *st.Resident) || (st.ActiveRequests != nil && *st.ActiveRequests != 0) {
-		return fmt.Errorf("unload did not reach idle unloaded state")
+	if st.State == WireUnloaded && st.Residency == ResidencyNotResident && st.ActiveRequests == 0 {
+		return nil
+	}
+	if st.ActiveRequests > 0 {
+		return fmt.Errorf("unload refused while active_requests=%d", st.ActiveRequests)
+	}
+	if st.State == WireLoading {
+		return fmt.Errorf("refusing unload while loading")
+	}
+	body, err := c.postControl(ctx, "/control/unload", timeout)
+	if err != nil {
+		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
+			return err
+		}
+		observed, ferr := c.fetchStatus(context.Background())
+		if ferr != nil {
+			return err
+		}
+		if observed.State == WireUnloaded && observed.Residency == ResidencyNotResident && observed.ActiveRequests == 0 {
+			return nil
+		}
+		return fmt.Errorf("unload not confirmed: state=%s residency=%s", observed.State, observed.Residency)
+	}
+	parsed, err := ParseStatus(body)
+	if err != nil {
+		return err
+	}
+	if parsed.State != WireUnloaded || parsed.Residency != ResidencyNotResident || parsed.ActiveRequests != 0 {
+		return fmt.Errorf("unload response is not unloaded")
 	}
 	return nil
 }
 
-func (c *Client) postControl(ctx context.Context, path string, timeout time.Duration) error {
+func (c *Client) postLoad(ctx context.Context, deadline time.Time) (Status, error) {
+	remaining := deadline.Sub(c.clock.Now())
+	if remaining <= 0 {
+		return Status{}, fmt.Errorf("load deadline exceeded")
+	}
+	body, err := c.postControl(ctx, "/control/load", remaining)
+	if err != nil {
+		return Status{}, err
+	}
+	st, err := ParseStatus(body)
+	if err != nil {
+		return Status{}, err
+	}
+	return st, nil
+}
+
+func (c *Client) postControl(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -394,45 +483,44 @@ func (c *Client) postControl(ctx context.Context, path string, timeout time.Dura
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewBufferString(`{}`))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, bytes.TrimSpace(body))
+		code, message, perr := ParseControlError(body)
+		if perr != nil {
+			return nil, fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, bytes.TrimSpace(body))
+		}
+		return nil, &ControlFault{Status: resp.StatusCode, Code: code, Message: message}
 	}
-	return nil
+	return body, nil
 }
 
-func (c *Client) waitHealth(ctx context.Context, deadline time.Time) error {
-	first := true
+func (c *Client) waitReady(ctx context.Context, deadline time.Time) error {
 	for {
 		if !c.clock.Now().Before(deadline) {
-			return fmt.Errorf("health check timed out after %s", c.healthCheckTimeout)
+			return fmt.Errorf("ready check timed out after %s", c.healthCheckTimeout)
 		}
-		reqCtx, cancel := context.WithTimeout(ctx, c.statusTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.baseURL+"/health", nil)
+		st, err := c.fetchStatus(ctx)
 		if err != nil {
-			cancel()
-			return err
-		}
-		resp, err := c.http.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			cancel()
-			return nil
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-		cancel()
-		if first {
-			first = false
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		} else {
+			switch st.State {
+			case WireReady:
+				return nil
+			case WireFailed:
+				return fmt.Errorf("remote state=failed residency=%s", st.Residency)
+			case WireUnloaded:
+				return fmt.Errorf("load ended unloaded")
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -444,23 +532,24 @@ func (c *Client) waitHealth(ctx context.Context, deadline time.Time) error {
 
 func (c *Client) applyReconcile(ctx context.Context, setState func(State)) error {
 	st, err := c.fetchStatus(ctx)
-	if isEndpointDown(err) {
-		return nil
-	}
 	if err != nil {
+		setState(StateUnknown)
+		c.handler.Store(nil)
 		return nil
 	}
-	switch st.ModelState {
-	case "ready":
+	switch st.State {
+	case WireReady:
 		c.installProxy()
 		setState(StateReady)
-	case "unloaded":
+	case WireUnloaded:
+		c.handler.Store(nil)
 		setState(StateStopped)
-	case "loading":
+	case WireLoading:
 		setState(StateStarting)
-	case "unloading":
+	case WireUnloading:
 		setState(StateStopping)
-	case "failed":
+	case WireFailed:
+		c.handler.Store(nil)
 		setState(StateFailed)
 	default:
 		setState(StateUnknown)
@@ -487,12 +576,9 @@ func (c *Client) fetchStatus(ctx context.Context) (Status, error) {
 	if resp.StatusCode != http.StatusOK {
 		return Status{}, fmt.Errorf("status: HTTP %d", resp.StatusCode)
 	}
-	if !json.Valid(body) {
-		return Status{}, fmt.Errorf("status: malformed json")
-	}
-	var st Status
-	if err := json.Unmarshal(body, &st); err != nil {
-		return Status{}, fmt.Errorf("status: %w", err)
+	st, err := ParseStatus(body)
+	if err != nil {
+		return Status{}, err
 	}
 	return st, nil
 }
@@ -549,6 +635,28 @@ func isEndpointDown(err error) bool {
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "server closed") ||
 		strings.Contains(strings.ToLower(msg), "eof")
+}
+
+func lastCode(st Status) string {
+	if st.LastError == nil {
+		return ""
+	}
+	return st.LastError.Code
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -27,9 +27,8 @@ type Server struct {
 
 	endpointAlive bool
 	prepareFail   bool
-	loadFail      bool
+	loadFail      LoadFailMode
 	unloadFail    bool
-	healthHeld    bool
 	persistInfer  bool
 	statusMode    StatusMode
 
@@ -37,16 +36,13 @@ type Server struct {
 	loadGate    *testkit.Barrier
 	unloadGate  *testkit.Barrier
 	inferGate   *testkit.Barrier
-	healthGate  *testkit.Barrier
 	backendGate *testkit.Barrier
 
-	modelState     ModelState
-	inferenceReady bool
-	resident       *bool
-	active         *int
-	lastError      *LastError
-	gpu            *GPUSnapshot
-	counts         Counts
+	modelState WireState
+	residency  Residency
+	active     int
+	lastError  *LastError
+	counts     Counts
 
 	loadCh   chan struct{}
 	unloadCh chan struct{}
@@ -62,25 +58,31 @@ func WithPrepareGate(g *testkit.Barrier) Option { return func(s *Server) { s.pre
 func WithLoadGate(g *testkit.Barrier) Option    { return func(s *Server) { s.loadGate = g } }
 func WithUnloadGate(g *testkit.Barrier) Option  { return func(s *Server) { s.unloadGate = g } }
 func WithInferGate(g *testkit.Barrier) Option   { return func(s *Server) { s.inferGate = g } }
-func WithHealthGate(g *testkit.Barrier) Option  { return func(s *Server) { s.healthGate = g } }
 func WithBackendGate(g *testkit.Barrier) Option { return func(s *Server) { s.backendGate = g } }
 
 func WithPrepareFailure() Option { return func(s *Server) { s.prepareFail = true } }
-func WithLoadFailure() Option    { return func(s *Server) { s.loadFail = true } }
-func WithUnloadFailure() Option  { return func(s *Server) { s.unloadFail = true } }
-func WithHealthDelay() Option    { return func(s *Server) { s.healthHeld = true } }
+func WithLoadFailure() Option    { return func(s *Server) { s.loadFail = LoadFailNotResident } }
+func WithLoadFailureUnknown() Option {
+	return func(s *Server) { s.loadFail = LoadFailUnknown }
+}
+func WithUnloadFailure() Option { return func(s *Server) { s.unloadFail = true } }
 func WithPersistInference() Option {
 	return func(s *Server) { s.persistInfer = true }
+}
+func WithInitialLoading() Option {
+	return func(s *Server) {
+		s.modelState = StateLoading
+		s.residency = ResidencyUnknown
+	}
 }
 
 func New(name string, opts ...Option) (*Server, error) {
 	s := &Server{
-		name:           name,
-		endpointAlive:  true,
-		modelState:     StateUnloaded,
-		inferenceReady: false,
-		resident:       boolPtr(false),
-		active:         intPtr(0),
+		name:          name,
+		endpointAlive: true,
+		modelState:    StateUnloaded,
+		residency:     ResidencyNotResident,
+		active:        0,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -90,7 +92,6 @@ func New(name string, opts ...Option) (*Server, error) {
 	publicMux.HandleFunc("/control/load", s.handleLoad)
 	publicMux.HandleFunc("/control/unload", s.handleUnload)
 	publicMux.HandleFunc("/control/status", s.handleStatus)
-	publicMux.HandleFunc("/health", s.handleHealth)
 	publicMux.HandleFunc("/v1/", s.handleInference)
 
 	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -187,7 +188,17 @@ func (s *Server) SetStatusMode(mode StatusMode) {
 
 func (s *Server) SetLoadFailure(v bool) {
 	s.mu.Lock()
-	s.loadFail = v
+	if v {
+		s.loadFail = LoadFailNotResident
+	} else {
+		s.loadFail = LoadOK
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) SetLoadFailureMode(mode LoadFailMode) {
+	s.mu.Lock()
+	s.loadFail = mode
 	s.mu.Unlock()
 }
 
@@ -200,12 +211,6 @@ func (s *Server) SetUnloadFailure(v bool) {
 func (s *Server) SetPrepareFailure(v bool) {
 	s.mu.Lock()
 	s.prepareFail = v
-	s.mu.Unlock()
-}
-
-func (s *Server) SetGPUSnapshot(snap GPUSnapshot) {
-	s.mu.Lock()
-	s.gpu = &snap
 	s.mu.Unlock()
 }
 
@@ -225,11 +230,18 @@ func (s *Server) ForceUnloaded() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.modelState = StateUnloaded
-	s.inferenceReady = false
-	s.resident = boolPtr(false)
-	s.active = intPtr(0)
+	s.residency = ResidencyNotResident
+	s.active = 0
 	s.lastError = nil
-	s.healthHeld = false
+}
+
+func (s *Server) ForceFailed(res Residency) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelState = StateFailed
+	s.residency = res
+	s.active = 0
+	s.lastError = &LastError{Code: "LOAD_FAILED", Message: "injected"}
 }
 
 func (s *Server) Prepare(ctx context.Context) error {
@@ -252,7 +264,14 @@ func (s *Server) Prepare(ctx context.Context) error {
 	if fail {
 		return errors.New("prepare failed")
 	}
+	if already {
+		return nil
+	}
 	s.endpointAlive = true
+	s.modelState = StateUnloaded
+	s.residency = ResidencyNotResident
+	s.active = 0
+	s.lastError = nil
 	return nil
 }
 
@@ -269,38 +288,21 @@ func (s *Server) handlePrepare(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) statusLocked() Status {
-	st := Status{
-		ProtocolVersion:  ProtocolVersion,
-		EnvironmentReady: s.endpointAlive,
-		ModelState:       s.modelState,
-		InferenceReady:   s.inferenceReady,
-		Resident:         s.resident,
-		ActiveRequests:   s.active,
-		Resource: Resource{
-			DeviceID:              nil,
-			ObservedBytes:         nil,
-			UnloadedResidualBytes: nil,
-			Budget:                nil,
-		},
-		LastError: s.lastError,
+	return Status{
+		State:          s.modelState,
+		Residency:      s.residency,
+		ActiveRequests: s.active,
+		LastError:      s.lastError,
 	}
-	if s.gpu != nil && s.gpu.Err == nil {
-		v := s.gpu.FreeBytes
-		st.Resource.ObservedBytes = &v
-	}
-	return st
 }
 
 func (s *Server) busyLocked() bool {
-	return s.active != nil && *s.active > 0
+	return s.active > 0
 }
 
 func (s *Server) addActiveLocked(delta int) {
-	if s.active == nil {
-		s.active = intPtr(0)
-	}
-	*s.active += delta
-	if *s.active < 0 {
-		*s.active = 0
+	s.active += delta
+	if s.active < 0 {
+		s.active = 0
 	}
 }

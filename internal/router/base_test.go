@@ -47,12 +47,7 @@ func (s *stubRT) Stop(ctx context.Context, timeout time.Duration) error {
 func (s *stubRT) Status(ctx context.Context) (runtime.Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.status
-	zero := 0
-	if st.ActiveRequests == nil {
-		st.ActiveRequests = &zero
-	}
-	return st, nil
+	return s.status, nil
 }
 
 func (s *stubRT) State() runtime.State {

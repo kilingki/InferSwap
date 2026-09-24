@@ -141,10 +141,7 @@ func (s *FIFO) OnStatus(ev StatusEvent) {
 	if ev.Err != nil {
 		return
 	}
-	if ev.Status.ActiveRequests == nil {
-		return
-	}
-	s.backend[ev.ModelID] = *ev.Status.ActiveRequests
+	s.backend[ev.ModelID] = ev.Status.ActiveRequests
 	if s.backend[ev.ModelID] <= 0 {
 		delete(s.backend, ev.ModelID)
 	}

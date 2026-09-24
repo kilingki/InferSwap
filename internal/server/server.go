@@ -82,9 +82,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		st := map[string]any{
-			"state":    "unknown",
-			"ready":    nil,
-			"resident": nil,
+			"state":     "unknown",
+			"ready":     nil,
+			"residency": nil,
 		}
 		if rt, ok := s.rts[id]; ok {
 			state := rt.State()
@@ -92,11 +92,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			switch state {
 			case runtime.StateUnknown:
 				st["ready"] = nil
-				st["resident"] = nil
+				st["residency"] = nil
 			default:
 				st["ready"] = state == runtime.StateReady
-				if remote, err := rt.Status(r.Context()); err == nil && remote.Resident != nil {
-					st["resident"] = *remote.Resident
+				if remote, err := rt.Status(r.Context()); err == nil {
+					st["residency"] = string(remote.Residency)
 				}
 			}
 		}

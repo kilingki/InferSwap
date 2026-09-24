@@ -119,7 +119,7 @@ func TestAInFlightThenBSwap(t *testing.T) {
 		t.Fatal("must not unload while A busy")
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
-	f.status["A"] = runtime.Status{ActiveRequests: intPtr(0)}
+	f.status["A"] = runtime.Status{ActiveRequests: 0}
 	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
 	if len(f.unloads) != 1 {
 		t.Fatalf("unloads=%v", f.unloads)
@@ -147,7 +147,7 @@ func TestNoReadyFastPathOverEarlierWaiter(t *testing.T) {
 		t.Fatalf("A2 must not skip B1, grants=%v", f.grants)
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
-	f.status["A"] = runtime.Status{ActiveRequests: intPtr(0)}
+	f.status["A"] = runtime.Status{ActiveRequests: 0}
 	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
 	f.states["A"] = runtime.StateStopped
 	s.OnUnloadDone(UnloadDone{IDs: []string{"A"}})
@@ -215,7 +215,7 @@ func TestCancelDoesNotStartLoad(t *testing.T) {
 	s.OnRequest(req(2, "B"))
 	s.OnCancel(req(2, "B"))
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
-	f.status["A"] = runtime.Status{ActiveRequests: intPtr(0)}
+	f.status["A"] = runtime.Status{ActiveRequests: 0}
 	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
 	if len(f.unloads) != 0 || len(f.loads) != 0 {
 		t.Fatalf("cancel caused swap unloads=%v loads=%v", f.unloads, f.loads)
@@ -231,7 +231,7 @@ func TestBNotStarvedByContinuousA(t *testing.T) {
 	s.OnRequest(req(3, "A"))
 	s.OnRequest(req(4, "A"))
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
-	f.status["A"] = runtime.Status{ActiveRequests: intPtr(0)}
+	f.status["A"] = runtime.Status{ActiveRequests: 0}
 	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
 	f.states["A"] = runtime.StateStopped
 	s.OnUnloadDone(UnloadDone{IDs: []string{"A"}})
@@ -287,7 +287,7 @@ func TestServeDoneBackendActiveBlocksUnload(t *testing.T) {
 	s.OnRequest(req(1, "A"))
 	s.OnProxyStart(ProxyStartEvent{ModelID: "A", OK: make(chan bool, 1)})
 	s.OnRequest(req(2, "B"))
-	s.OnStatus(StatusEvent{ModelID: "A", Status: runtime.Status{ActiveRequests: intPtr(1)}})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: runtime.Status{ActiveRequests: 1}})
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	if len(f.unloads) != 0 {
 		t.Fatal("unload while backend active")
@@ -312,7 +312,7 @@ func TestReopenGateWhenBCanceledBeforeUnload(t *testing.T) {
 		t.Fatal("A gate should reopen")
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
-	f.status["A"] = runtime.Status{ActiveRequests: intPtr(0)}
+	f.status["A"] = runtime.Status{ActiveRequests: 0}
 	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
 	if len(f.unloads) != 0 {
 		t.Fatal("unloaded after demand vanished")
@@ -394,5 +394,3 @@ func TestUnknownModel(t *testing.T) {
 		t.Fatalf("grants=%v", f.grants)
 	}
 }
-
-func intPtr(v int) *int { return &v }

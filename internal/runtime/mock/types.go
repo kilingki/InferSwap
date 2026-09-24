@@ -5,38 +5,31 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"time"
 )
 
-const ProtocolVersion = "v0"
-
-type ModelState string
+type WireState string
 
 const (
-	StateUnloaded  ModelState = "unloaded"
-	StateLoading   ModelState = "loading"
-	StateReady     ModelState = "ready"
-	StateUnloading ModelState = "unloading"
-	StateFailed    ModelState = "failed"
-	StateUnknown   ModelState = "unknown"
+	StateUnloaded  WireState = "unloaded"
+	StateLoading   WireState = "loading"
+	StateReady     WireState = "ready"
+	StateUnloading WireState = "unloading"
+	StateFailed    WireState = "failed"
+)
+
+type Residency string
+
+const (
+	ResidencyResident    Residency = "resident"
+	ResidencyNotResident Residency = "not_resident"
+	ResidencyUnknown     Residency = "unknown"
 )
 
 type Status struct {
-	ProtocolVersion  string     `json:"protocol_version"`
-	EnvironmentReady bool       `json:"environment_ready"`
-	ModelState       ModelState `json:"model_state"`
-	InferenceReady   bool       `json:"inference_ready"`
-	Resident         *bool      `json:"resident"`
-	ActiveRequests   *int       `json:"active_requests"`
-	Resource         Resource   `json:"resource"`
-	LastError        *LastError `json:"last_error"`
-}
-
-type Resource struct {
-	DeviceID              *string `json:"device_id"`
-	ObservedBytes         *int64  `json:"observed_bytes"`
-	UnloadedResidualBytes *int64  `json:"unloaded_residual_bytes"`
-	Budget                any     `json:"budget"`
+	State          WireState  `json:"state"`
+	Residency      Residency  `json:"residency"`
+	ActiveRequests int        `json:"active_requests"`
+	LastError      *LastError `json:"last_error"`
 }
 
 type LastError struct {
@@ -44,10 +37,11 @@ type LastError struct {
 	Message string `json:"message"`
 }
 
-type ControlError struct {
-	Error string `json:"error"`
-	Src   string `json:"src"`
-	Code  string `json:"code"`
+type controlErrorBody struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type Counts struct {
@@ -59,26 +53,28 @@ type Counts struct {
 	UnloadEnds    int
 	InferStarts   int
 	InferEnds     int
-	HealthChecks  int
 }
 
 type StatusMode int
 
 const (
 	StatusNormal StatusMode = iota
-	StatusUnknown
 	StatusMalformed
 	StatusTransportError
+	StatusUnreliable
+	StatusNullActive
+	StatusNegativeActive
+	StatusReadyNotResident
+	StatusMissingActive
 )
 
-type GPUSnapshot struct {
-	FreeBytes int64
-	At        time.Time
-	Err       error
-}
+type LoadFailMode int
 
-func boolPtr(v bool) *bool { return &v }
-func intPtr(v int) *int    { return &v }
+const (
+	LoadOK LoadFailMode = iota
+	LoadFailNotResident
+	LoadFailUnknown
+)
 
 type constError string
 
@@ -112,5 +108,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeControlError(w http.ResponseWriter, status int, message, code string) {
-	writeJSON(w, status, ControlError{Error: message, Src: "runtime", Code: code})
+	var body controlErrorBody
+	body.Error.Code = code
+	body.Error.Message = message
+	writeJSON(w, status, body)
 }
