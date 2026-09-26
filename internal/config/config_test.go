@@ -199,9 +199,25 @@ func TestLoadExampleFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := cfg.Resolve("qwen"); !ok {
-		t.Fatal("example alias qwen")
+	if id, ok := cfg.Resolve("qwen3-asr"); !ok || id != "qwen-asr" {
+		t.Fatalf("Resolve(qwen3-asr)=%q ok=%v", id, ok)
 	}
+	if _, ok := cfg.Model("qwen-fa"); !ok {
+		t.Fatal("example qwen-fa")
+	}
+	if _, ok := cfg.Resolve("qwen"); ok {
+		t.Fatal("unmeasured alias qwen must not resolve")
+	}
+	if _, ok := cfg.Resolve("qwen3.8-27b"); ok {
+		t.Fatal("unmeasured model qwen3.8-27b must not resolve")
+	}
+	if len(cfg.Models) != 2 {
+		t.Fatalf("example models=%d", len(cfg.Models))
+	}
+}
+
+func TestRejectLogLevel(t *testing.T) {
+	mustReject(t, strings.Replace(validYAML, "logLevel: info", "logLevel: verbose", 1), "logLevel")
 }
 
 func TestRejectResource(t *testing.T) {

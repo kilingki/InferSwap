@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -60,6 +61,15 @@ func (r *Router) WaitLoad(ctx context.Context, model string) error {
 }
 
 func (r *Router) grantLoad(id string) error {
+	if err := r.admitLoad(id); err != nil {
+		slog.Info("load admission denied", "model", id, "err", err)
+		return err
+	}
+	slog.Info("load admitted", "model", id)
+	return nil
+}
+
+func (r *Router) admitLoad(id string) error {
 	if r.shutting.Load() {
 		return scheduler.ErrShutdown
 	}

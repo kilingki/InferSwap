@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/kilingki/InferSwap/internal/config"
 	"github.com/kilingki/InferSwap/internal/proxy"
@@ -132,6 +133,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Name    string         `json:"name,omitempty"`
 		Status  map[string]any `json:"status"`
 	}
+	diag := s.router.Diagnostics()
 	out := make([]rec, 0)
 	ids := make([]string, 0, len(s.cfg.Models))
 	for id := range s.cfg.Models {
@@ -143,10 +145,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if m.Unlisted {
 			continue
 		}
+		md := diag.Models[id]
 		st := map[string]any{
-			"state":     "unknown",
-			"ready":     nil,
-			"residency": nil,
+			"state":          "unknown",
+			"ready":          nil,
+			"residency":      nil,
+			"reason":         md.Reason,
+			"reserved_bytes": md.ReservedBytes,
+			"last_error":     errorRecord(md.LastError),
 		}
 		if rt, ok := s.rts[id]; ok {
 			state := rt.State()
@@ -159,6 +165,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				st["ready"] = state == runtime.StateReady
 				if remote, err := rt.Status(r.Context()); err == nil {
 					st["residency"] = string(remote.Residency)
+					st["last_error"] = errorRecord(remote.LastError)
 				}
 			}
 		}
@@ -170,8 +177,29 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			Status:  st,
 		})
 	}
+	var observed any
+	if !diag.GPU.ObservedAt.IsZero() {
+		observed = diag.GPU.ObservedAt.Format(time.RFC3339Nano)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": out})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object":      "list",
+		"queue_depth": diag.QueueDepth,
+		"gpu": map[string]any{
+			"observed_at": observed,
+			"fresh":       diag.GPU.Fresh,
+			"total":       diag.GPU.Total,
+			"free":        diag.GPU.Free,
+		},
+		"data": out,
+	})
+}
+
+func errorRecord(err *runtime.LastError) any {
+	if err == nil {
+		return nil
+	}
+	return map[string]string{"code": err.Code, "message": err.Message}
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

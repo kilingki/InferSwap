@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -212,6 +213,9 @@ func (raw rawFile) toConfig() (*Config, error) {
 		Preload:      append([]string{}, raw.Preload...),
 		Models:       make(map[string]Model),
 		aliases:      make(map[string]string),
+	}
+	if _, err := ParseLogLevel(cfg.LogLevel); err != nil {
+		return nil, err
 	}
 	var err error
 	if cfg.HealthCheckTimeout, err = seconds("healthCheckTimeout", raw.HealthCheckTimeout, defaultHealthCheckTimeout); err != nil {
@@ -454,6 +458,21 @@ func (rm rawModel) toModel(id string, globals *Config) (Model, error) {
 		}
 	}
 	return m, nil
+}
+
+func ParseLogLevel(level string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("config: logLevel %q is not one of debug, info, warn, error", level)
+	}
 }
 
 func (c *Config) Resolve(idOrAlias string) (string, bool) {

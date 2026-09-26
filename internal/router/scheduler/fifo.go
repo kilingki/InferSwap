@@ -31,12 +31,12 @@ type FIFO struct {
 	unresolved  map[string]int
 	dispatchGen map[string]uint64
 	quietGen    map[string]uint64
-	gateClosed map[string]bool
-	gateAt     map[string]time.Time
-	drain      time.Duration
-	drainArmed bool
-	now        func() time.Time
-	unloadFail map[string]bool
+	gateClosed  map[string]bool
+	gateAt      map[string]time.Time
+	drain       time.Duration
+	drainArmed  bool
+	now         func() time.Time
+	unloadFail  map[string]bool
 
 	phase       phase
 	swapTarget  string
@@ -64,10 +64,10 @@ func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
 		}
 	}
 	return &FIFO{
-		planner:    planner,
-		effects:    effects,
-		limits:     limits,
-		maxQ:       maxQ,
+		planner:     planner,
+		effects:     effects,
+		limits:      limits,
+		maxQ:        maxQ,
 		pending:     map[string]int{},
 		httpIn:      map[string]int{},
 		backend:     map[string]int{},
@@ -78,7 +78,7 @@ func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
 		gateAt:      map[string]time.Time{},
 		drain:       drain,
 		now:         time.Now,
-		unloadFail: map[string]bool{},
+		unloadFail:  map[string]bool{},
 	}
 }
 
@@ -491,6 +491,8 @@ func (s *FIFO) blocked(model string) bool {
 }
 
 func (s *FIFO) queuedLen() int { return len(s.queued) }
+
+func (s *FIFO) QueueDepth() int { return len(s.queued) }
 
 func (s *FIFO) admit(req HandlerReq, err error) bool {
 	if req.Admit == nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -62,6 +63,7 @@ type Client struct {
 	reconCh chan reconReq
 
 	state   atomic.Value
+	reason  atomic.Value
 	handler atomic.Pointer[http.Handler]
 	gen     atomic.Uint64
 
@@ -115,6 +117,7 @@ func NewClient(parent context.Context, model config.Model, globals *config.Confi
 		reconCh:            make(chan reconReq),
 	}
 	c.state.Store(StateUnknown)
+	c.reason.Store("")
 	go c.run()
 	return c
 }
@@ -132,6 +135,13 @@ func (c *Client) State() State {
 		return s
 	}
 	return StateUnknown
+}
+
+func (c *Client) StateReason() string {
+	if s, ok := c.reason.Load().(string); ok {
+		return s
+	}
+	return ""
 }
 
 func (c *Client) Shutdown() {
@@ -217,9 +227,15 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (c *Client) run() {
 	state := StateUnknown
-	setState := func(s State) {
+	setState := func(s State, reason string) {
+		prev, _ := c.state.Load().(State)
+		prevReason, _ := c.reason.Load().(string)
 		state = s
 		c.state.Store(s)
+		c.reason.Store(reason)
+		if prev != s || prevReason != reason {
+			slog.Info("runtime state", "model", c.id, "state", string(s), "reason", reason)
+		}
 	}
 	var waiters []readyReq
 	var opCancel context.CancelFunc
@@ -236,7 +252,7 @@ func (c *Client) run() {
 	}
 
 	startOp := func(timeout time.Duration) {
-		setState(StateStarting)
+		setState(StateStarting, "load")
 		gen := c.gen.Add(1)
 		ctx, cancel := context.WithCancel(context.Background())
 		opCancel = cancel
@@ -249,7 +265,7 @@ func (c *Client) run() {
 	for {
 		select {
 		case <-c.parent.Done():
-			setState(StateShutdown)
+			setState(StateShutdown, "shutdown")
 			if opCancel != nil {
 				opCancel()
 			}
@@ -291,12 +307,12 @@ func (c *Client) run() {
 			}
 			if res.err != nil {
 				c.handler.Store(nil)
-				setState(StateFailed)
+				setState(StateFailed, loadFailReason(res.err))
 				notify(res.err)
 				continue
 			}
 			c.installProxy()
-			setState(StateReady)
+			setState(StateReady, "ready")
 			notify(nil)
 
 		case req := <-c.stopCh:
@@ -313,13 +329,13 @@ func (c *Client) run() {
 				opCancel = nil
 				opDone = nil
 			}
-			setState(StateStopping)
+			setState(StateStopping, "unload")
 			err := c.doStop(req.timeout)
 			c.handler.Store(nil)
 			if err != nil {
-				setState(StateFailed)
+				setState(StateFailed, unloadFailReason(err))
 			} else {
-				setState(StateStopped)
+				setState(StateStopped, "unloaded")
 			}
 			notify(err)
 			req.respond <- err
@@ -566,29 +582,29 @@ func (c *Client) waitReady(ctx context.Context, deadline time.Time) error {
 	}
 }
 
-func (c *Client) applyReconcile(ctx context.Context, setState func(State)) error {
+func (c *Client) applyReconcile(ctx context.Context, setState func(State, string)) error {
 	st, err := c.fetchStatus(ctx)
 	if err != nil {
-		setState(StateUnknown)
+		setState(StateUnknown, "reconcile")
 		c.handler.Store(nil)
 		return nil
 	}
 	switch st.State {
 	case WireReady:
 		c.installProxy()
-		setState(StateReady)
+		setState(StateReady, "reconcile")
 	case WireUnloaded:
 		c.handler.Store(nil)
-		setState(StateStopped)
+		setState(StateStopped, "reconcile")
 	case WireLoading:
-		setState(StateStarting)
+		setState(StateStarting, "reconcile")
 	case WireUnloading:
-		setState(StateStopping)
+		setState(StateStopping, "reconcile")
 	case WireFailed:
 		c.handler.Store(nil)
-		setState(StateFailed)
+		setState(StateFailed, "reconcile")
 	default:
-		setState(StateUnknown)
+		setState(StateUnknown, "reconcile")
 	}
 	return nil
 }
@@ -678,6 +694,20 @@ func lastCode(st Status) string {
 		return ""
 	}
 	return st.LastError.Code
+}
+
+func loadFailReason(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+		return "timeout"
+	}
+	return "load_failed"
+}
+
+func unloadFailReason(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+		return "timeout"
+	}
+	return "unload_failed"
 }
 
 func isTimeout(err error) bool {

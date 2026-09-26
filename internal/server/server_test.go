@@ -16,6 +16,7 @@ import (
 	"github.com/kilingki/InferSwap/internal/router"
 	"github.com/kilingki/InferSwap/internal/runtime"
 	"github.com/kilingki/InferSwap/internal/runtime/mock"
+	"github.com/kilingki/InferSwap/internal/testkit"
 )
 
 func newTestStack(t *testing.T, a, b *mock.Server) http.Handler {
@@ -266,5 +267,132 @@ func TestUnsupportedPath404(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != 404 {
 		t.Fatalf("code=%d", w.Code)
+	}
+}
+
+func TestModelsReportsQueueReservationAndError(t *testing.T) {
+	gate := testkit.NewBarrier()
+	a, err := mock.New("A", mock.WithInferGate(gate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	cfg := &config.Config{
+		MaxQueueSize:       16,
+		QueueTimeout:       time.Minute,
+		StatusTimeout:      2 * time.Second,
+		UnloadTimeout:      2 * time.Second,
+		HealthCheckTimeout: 5 * time.Second,
+		Models: map[string]config.Model{
+			"model-a": {
+				ID: "model-a", Name: "A", BaseURL: a.URL(),
+				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
+				InferencePaths:  []string{"/v1/chat/completions"},
+				MaxBodyBytes:    32 << 20,
+				ResourceProfile: config.ResourceProfile{ProfileID: "a", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
+			},
+			"model-b": {
+				ID: "model-b", Name: "B", BaseURL: b.URL(),
+				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
+				InferencePaths:  []string{"/v1/chat/completions"},
+				MaxBodyBytes:    32 << 20,
+				ResourceProfile: config.ResourceProfile{ProfileID: "b", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
+			},
+		},
+	}
+	runtimes := map[string]runtime.Runtime{
+		"model-a": runtime.NewClient(context.Background(), cfg.Models["model-a"], cfg, runtime.ClientOptions{}),
+		"model-b": runtime.NewClient(context.Background(), cfg.Models["model-b"], cfg, runtime.ClientOptions{}),
+	}
+	rt := router.NewExclusive(cfg, runtimes, nil)
+	if err := rt.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gate.Release()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = rt.Shutdown(ctx)
+		for _, item := range runtimes {
+			if c, ok := item.(*runtime.Client); ok {
+				c.Shutdown()
+			}
+		}
+	})
+	h := New(cfg, rt, runtimes).Handler()
+
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[]}`))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := gate.WaitStarted(ctx); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[]}`))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	b.ForceFailed(mock.ResidencyNotResident)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var payload map[string]any
+	var raw []byte
+	for {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		raw = append([]byte(nil), w.Body.Bytes()...)
+		payload = map[string]any{}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["queue_depth"] == float64(1) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queue not visible: %s", raw)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	gpu, ok := payload["gpu"].(map[string]any)
+	if !ok {
+		t.Fatalf("gpu=%v", payload["gpu"])
+	}
+	if _, ok := gpu["fresh"]; !ok {
+		t.Fatalf("gpu=%v", gpu)
+	}
+	data := payload["data"].([]any)
+	var sawReserved, sawError bool
+	for _, item := range data {
+		row := item.(map[string]any)
+		st := row["status"].(map[string]any)
+		switch row["id"] {
+		case "model-a":
+			if st["reserved_bytes"] != float64(10) {
+				t.Fatalf("reserved=%v body=%s", st["reserved_bytes"], raw)
+			}
+			if st["reason"] != "ready" {
+				t.Fatalf("reason=%v", st["reason"])
+			}
+			sawReserved = true
+		case "model-b":
+			last, _ := st["last_error"].(map[string]any)
+			if last["code"] != "LOAD_FAILED" {
+				t.Fatalf("last_error=%v", st["last_error"])
+			}
+			sawError = true
+		}
+	}
+	if !sawReserved || !sawError {
+		t.Fatalf("missing fields: %s", raw)
 	}
 }

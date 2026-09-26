@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +25,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	level, err := config.ParseLogLevel(cfg.LogLevel)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	runtimes := make(map[string]runtime.Runtime, len(cfg.Models))
 	for id, model := range cfg.Models {
@@ -42,7 +48,7 @@ func main() {
 	srv := server.New(cfg, rt, runtimes)
 	httpSrv := &http.Server{Addr: cfg.Listen, Handler: srv.Handler()}
 	go func() {
-		log.Printf("inferswap listening on %s", cfg.Listen)
+		slog.Info("inferswap listening", "addr", cfg.Listen)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}
@@ -56,7 +62,7 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	if err := rt.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v remaining=%v", err, rt.Remaining())
+		slog.Error("shutdown", "err", err, "remaining", rt.Remaining())
 		os.Exit(1)
 	}
 }

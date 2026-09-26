@@ -18,16 +18,16 @@ Models are separate projects. InferSwap selects one only by `baseURL` and does n
 
 `config.example.yaml` records a measurement on this host. `nvidia-smi -L` reports `NVIDIA GeForce RTX 3090`, UUID `GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978`, 24576 MiB. NVML reads that device's total, free, and used bytes. The configured peaks were not lowered to force a pass.
 
-Measured on 2026-09-26 with host `nvidia-smi` total used, three load/inference/unload rounds. The example adds 1 GiB to each observed maximum:
+Measured on 2026-09-26 with host `nvidia-smi` total used. The example adds 1 GiB to the higher observed maximum and does not lower a peak that a later run did not exceed:
 
 | Model | Profile | Observed load | Observed inference | Residual | Configured peak |
 |---|---|---|---|---|---|
-| `qwen-asr` | `rtx3090-asr-2026-09-26` | 20011 MiB | 20015 MiB | 0 | 21039 MiB |
-| `qwen-fa` | `rtx3090-fa-2026-09-26` | 3229 MiB | 3256 MiB | 0 | 4280 MiB |
+| `qwen-asr` | `rtx3090-asr-2026-09-26` | 20011 MiB on 1s silence; 19583 MiB on 30min | 20015 MiB on 1s silence; 19682 MiB on 30min | 0 | 21039 MiB |
+| `qwen-fa` | `rtx3090-fa-2026-09-26` | 2793 MiB while loading | 5322 MiB | 0 | 6346 MiB |
 
-Unload returned to the host baseline near 1.4–1.5 GiB and did not grow across the three rounds, so residual 0 is a measurement. `maxConcurrency` is 1, matching those runs. ASR input was 1 second of 16 kHz silence. FA input was one Korean chunk on the same kind of audio. `qwen3.8-27b` in the example is still an unmeasured placeholder. If its endpoint is down, reconcile leaves it `unknown`, and that blocks every new load.
+The 30min input was 16 kHz mono PCM16, 57,600,044 bytes, three load/inference/unload rounds, external concurrency 1. ASR split it into 120s chunks and the engine log showed `Running: 2 reqs` while control `active_requests` stayed 1. FA aligned the same WAV as ten 180s Korean chunks with batch 4. Each of those six requests returned HTTP 200. Unload returned to the host baseline near 1.0–1.1 GiB and did not grow, so residual 0 remains a measurement. The example registers only these two measured models. An unmeasured model left `unknown` still has no residual bound and blocks every new load.
 
-Admission uses those configured peaks plus `gpu.safetyMarginBytes` of 1 GiB. 21039 + 4280 + 1024 MiB is 26343 MiB, which does not fit in 24576 MiB. Coexistence was rejected: the two models were not both ready. On the InferSwap path the caller did not call load or unload. A short ASR transcription returned HTTP 200 and left FA unloaded. The following `POST /align?model=qwen-fa` returned HTTP 200 and left ASR unloaded. A 33,603,052-byte WAV, above 32 MiB and under the 64 MiB `maxBodyBytes`, was forwarded and returned HTTP 200.
+Admission uses those configured peaks plus `gpu.safetyMarginBytes` of 1 GiB. 21039 + 6346 + 1024 MiB is 28409 MiB, which does not fit in 24576 MiB. Coexistence was rejected: the two models were not both ready. On the InferSwap path the caller did not call load or unload. A short ASR transcription returned HTTP 200 and left FA unloaded. The following `POST /align?model=qwen-fa` returned HTTP 200 and left ASR unloaded. The 30min rounds did the same swap. A 33,603,052-byte WAV, above 32 MiB and under the 64 MiB `maxBodyBytes`, was forwarded and returned HTTP 200.
 
 Also observed on this GPU, not by replaying mocks:
 
@@ -54,7 +54,7 @@ On start, InferSwap reads the configured GPU, reconciles each model's control st
 
 ## Configuration
 
-Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. `logLevel` is accepted and not read by the process. The example listens on `:8095` so it can run beside ASR `:8080` and FA `:8090` on this host.
+Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. `logLevel` is `debug`, `info`, `warn`, or `error` and sets the process slog level. The example listens on `:8095` so it can run beside ASR `:8080` and FA `:8090` on this host.
 
 | Key | Role |
 |---|---|
@@ -90,7 +90,7 @@ Per-model `timeouts` may override only `prepareTimeout`, `healthCheckTimeout`, a
 - `POST /v1/embeddings`
 - `POST /v1/audio/transcriptions`
 - `POST /align?model=<id or alias>` — the `model` query selects the route and is removed before the body is forwarded to `/align`.
-- `GET /v1/models` — registered models. `unlisted: true` is omitted. Each item includes `status.state`, `status.ready`, and `status.residency`. For `unknown`, `ready` and `residency` are null.
+- `GET /v1/models` — registered models. `unlisted: true` is omitted. The list includes `queue_depth` and `gpu` (`observed_at`, `fresh`, `total`, `free`). Each item includes `status.state`, `status.ready`, `status.residency`, `status.reason`, `status.reserved_bytes`, and `status.last_error`. For `unknown`, `ready` and `residency` are null.
 - `GET /health` — InferSwap process liveness. Model readiness is control status.
 
 `model` may be a canonical id or an alias, in JSON, `multipart/form-data`, or the query string. A body larger than that model's `maxBodyBytes` is rejected with HTTP 413. A path outside `inferencePaths` is HTTP 404. InferSwap errors are JSON with `error`, `src` (`inferswap`), and `code`.

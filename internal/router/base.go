@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -43,13 +44,13 @@ type Router struct {
 	lastStatus      map[string]runtime.Status
 	nextReq         atomic.Uint64
 
-	observer    resource.Observer
-	device      string
-	snap        resource.Snapshot
-	observeCh   chan resource.Snapshot
-	reserved    map[string]int64
-	lastUse     map[string]time.Time
-	loadedAt    map[string]time.Time
+	observer       resource.Observer
+	device         string
+	snap           resource.Snapshot
+	observeCh      chan resource.Snapshot
+	reserved       map[string]int64
+	lastUse        map[string]time.Time
+	loadedAt       map[string]time.Time
 	loadSerial     string
 	bootGPU        bool
 	admitCh        chan admitReq
@@ -176,7 +177,10 @@ func (r *Router) run() {
 		case notice := <-r.unloadNoticeCh:
 			r.finishUnload(notice)
 		case ev := <-r.swapDoneCh:
-			if ev.Err == nil {
+			if ev.Err != nil {
+				slog.Info("load failed", "model", ev.ModelID, "err", ev.Err)
+			} else {
+				slog.Info("load ready", "model", ev.ModelID)
 				r.noteLoaded(ev.ModelID)
 			}
 			if r.loadSerial == ev.ModelID {
@@ -245,10 +249,13 @@ func (r *Router) applyObservation(snap resource.Snapshot) {
 func (r *Router) finishUnload(notice unloadNotice) {
 	ev := notice.ev
 	if ev.Err == nil {
+		slog.Info("unload confirmed", "models", ev.IDs)
 		for _, id := range ev.IDs {
 			r.residualAfter[id] = notice.at
 		}
 		r.applyObservation(notice.sample)
+	} else {
+		slog.Info("unload failed", "models", ev.IDs, "err", ev.Err)
 	}
 	r.schedule.OnUnloadDone(ev)
 }
@@ -433,6 +440,7 @@ func (r *Router) StartLoad(modelID string) {
 }
 
 func (r *Router) GrantError(req scheduler.HandlerReq, err error) {
+	slog.Info("admission denied", "model", req.Model, "err", err)
 	r.grant(req, scheduler.HandlerResp{Err: err})
 }
 
