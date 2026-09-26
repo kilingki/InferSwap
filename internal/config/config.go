@@ -23,7 +23,14 @@ const (
 	defaultShutdownTimeout    = 60
 	defaultMaxQueueSize       = 256
 	defaultConcurrencyLimit   = 1
+	defaultMaxObservationAge  = 5
 )
+
+var controlPaths = map[string]struct{}{
+	"/control/status": {},
+	"/control/load":   {},
+	"/control/unload": {},
+}
 
 var forbiddenTopLevel = []string{
 	"cmd", "cmdStop", "env", "proxy", "checkEndpoint", "groups", "macros",
@@ -51,7 +58,14 @@ type rawFile struct {
 	ShutdownTimeout    *int                `yaml:"shutdownTimeout"`
 	MaxQueueSize       *int                `yaml:"maxQueueSize"`
 	Preload            []string            `yaml:"preload"`
+	GPU                *rawGPU             `yaml:"gpu"`
 	Models             map[string]rawModel `yaml:"models"`
+}
+
+type rawGPU struct {
+	Device            *string `yaml:"device"`
+	SafetyMarginBytes *int64  `yaml:"safetyMarginBytes"`
+	MaxObservationAge *int    `yaml:"maxObservationAge"`
 }
 
 type rawModel struct {
@@ -62,6 +76,18 @@ type rawModel struct {
 	Unlisted         *bool          `yaml:"unlisted"`
 	Prepare          *rawPrepare    `yaml:"prepare"`
 	Timeouts         map[string]int `yaml:"timeouts"`
+	ResourceProfile  *rawProfile    `yaml:"resourceProfile"`
+	InferencePaths   []string       `yaml:"inferencePaths"`
+	MaxBodyBytes     *int64         `yaml:"maxBodyBytes"`
+}
+
+type rawProfile struct {
+	ProfileID             *string        `yaml:"profileId"`
+	LoadPeakBytes         *int64         `yaml:"loadPeakBytes"`
+	InferencePeakBytes    *int64         `yaml:"inferencePeakBytes"`
+	UnloadedResidualBytes *int64         `yaml:"unloadedResidualBytes"`
+	MaxConcurrency        *int           `yaml:"maxConcurrency"`
+	Limits                map[string]any `yaml:"limits"`
 }
 
 type rawPrepare struct {
@@ -80,8 +106,15 @@ type Config struct {
 	ShutdownTimeout    time.Duration
 	MaxQueueSize       int
 	Preload            []string
+	GPU                GPU
 	Models             map[string]Model
 	aliases            map[string]string
+}
+
+type GPU struct {
+	Device            string
+	SafetyMarginBytes int64
+	MaxObservationAge time.Duration
 }
 
 type Model struct {
@@ -95,6 +128,18 @@ type Model struct {
 	PrepareTimeout     time.Duration
 	HealthCheckTimeout time.Duration
 	UnloadTimeout      time.Duration
+	ResourceProfile    ResourceProfile
+	InferencePaths     []string
+	MaxBodyBytes       int64
+}
+
+type ResourceProfile struct {
+	ProfileID             string
+	LoadPeakBytes         int64
+	InferencePeakBytes    int64
+	UnloadedResidualBytes int64
+	MaxConcurrency        int
+	Limits                map[string]any
 }
 
 type Prepare struct {
@@ -223,7 +268,122 @@ func (raw rawFile) toConfig() (*Config, error) {
 			return nil, fmt.Errorf("config: preload %q is not a registered model", id)
 		}
 	}
+	gpu, err := raw.GPU.toGPU()
+	if err != nil {
+		return nil, err
+	}
+	cfg.GPU = gpu
+	for id, m := range cfg.Models {
+		rm := raw.Models[id]
+		profile, paths, body, err := rm.resource(id, m.ConcurrencyLimit)
+		if err != nil {
+			return nil, err
+		}
+		m.ResourceProfile = profile
+		m.InferencePaths = paths
+		m.MaxBodyBytes = body
+		cfg.Models[id] = m
+	}
 	return cfg, nil
+}
+
+func (raw *rawGPU) toGPU() (GPU, error) {
+	if raw == nil || raw.Device == nil || strings.TrimSpace(*raw.Device) == "" {
+		return GPU{}, fmt.Errorf("config: gpu.device is required")
+	}
+	margin := int64(0)
+	if raw.SafetyMarginBytes != nil {
+		margin = *raw.SafetyMarginBytes
+	}
+	if margin < 0 {
+		return GPU{}, fmt.Errorf("config: gpu.safetyMarginBytes must not be negative")
+	}
+	age, err := seconds("gpu.maxObservationAge", raw.MaxObservationAge, defaultMaxObservationAge)
+	if err != nil {
+		return GPU{}, err
+	}
+	return GPU{Device: strings.TrimSpace(*raw.Device), SafetyMarginBytes: margin, MaxObservationAge: age}, nil
+}
+
+func (rm rawModel) resource(id string, concurrency int) (ResourceProfile, []string, int64, error) {
+	if rm.ResourceProfile == nil {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile is required", id)
+	}
+	p := rm.ResourceProfile
+	if p.ProfileID == nil || strings.TrimSpace(*p.ProfileID) == "" {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile.profileId is required", id)
+	}
+	load, err := nonNeg(id, "loadPeakBytes", p.LoadPeakBytes)
+	if err != nil {
+		return ResourceProfile{}, nil, 0, err
+	}
+	inf, err := nonNeg(id, "inferencePeakBytes", p.InferencePeakBytes)
+	if err != nil {
+		return ResourceProfile{}, nil, 0, err
+	}
+	residual, err := nonNeg(id, "unloadedResidualBytes", p.UnloadedResidualBytes)
+	if err != nil {
+		return ResourceProfile{}, nil, 0, err
+	}
+	peak := load
+	if inf > peak {
+		peak = inf
+	}
+	if residual > peak {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: unloadedResidualBytes exceeds peak", id)
+	}
+	if p.MaxConcurrency == nil || *p.MaxConcurrency <= 0 {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile.maxConcurrency must be positive", id)
+	}
+	if concurrency > *p.MaxConcurrency {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: concurrencyLimit exceeds maxConcurrency", id)
+	}
+	if len(rm.InferencePaths) == 0 {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inferencePaths is required", id)
+	}
+	paths := make([]string, 0, len(rm.InferencePaths))
+	seen := map[string]struct{}{}
+	for _, path := range rm.InferencePaths {
+		if !strings.HasPrefix(path, "/") || strings.Contains(path, "?") {
+			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inference path %q is invalid", id, path)
+		}
+		if _, ok := controlPaths[path]; ok {
+			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inference path %q is a control path", id, path)
+		}
+		if _, ok := seen[path]; ok {
+			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: duplicate inference path %q", id, path)
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	if rm.MaxBodyBytes == nil {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: maxBodyBytes is required", id)
+	}
+	if *rm.MaxBodyBytes < 0 {
+		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: maxBodyBytes must not be negative", id)
+	}
+	limits := map[string]any{}
+	for k, v := range p.Limits {
+		limits[k] = v
+	}
+	return ResourceProfile{
+		ProfileID:             strings.TrimSpace(*p.ProfileID),
+		LoadPeakBytes:         load,
+		InferencePeakBytes:    inf,
+		UnloadedResidualBytes: residual,
+		MaxConcurrency:        *p.MaxConcurrency,
+		Limits:                limits,
+	}, paths, *rm.MaxBodyBytes, nil
+}
+
+func nonNeg(id, name string, v *int64) (int64, error) {
+	if v == nil {
+		return 0, fmt.Errorf("config: model %q: resourceProfile.%s is required", id, name)
+	}
+	if *v < 0 {
+		return 0, fmt.Errorf("config: model %q: resourceProfile.%s must not be negative", id, name)
+	}
+	return *v, nil
 }
 
 func (rm rawModel) toModel(id string, globals *Config) (Model, error) {
@@ -312,6 +472,22 @@ func (c *Config) Index() {
 			c.aliases[alias] = id
 		}
 	}
+}
+
+func (m Model) AllowsPath(path string) bool {
+	for _, p := range m.InferencePaths {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) LoadBound() int64 {
+	if m.ResourceProfile.InferencePeakBytes > m.ResourceProfile.LoadPeakBytes {
+		return m.ResourceProfile.InferencePeakBytes
+	}
+	return m.ResourceProfile.LoadPeakBytes
 }
 
 func (c *Config) Model(idOrAlias string) (Model, bool) {

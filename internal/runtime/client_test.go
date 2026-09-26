@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,6 +63,7 @@ func (r *recCommander) Runs() int {
 func newClient(t *testing.T, s *mock.Server, model config.Model, opts ClientOptions) *Client {
 	t.Helper()
 	c := NewClient(context.Background(), model, testGlobals(), opts)
+	c.SetLoadGate(func(context.Context) error { return nil })
 	t.Cleanup(c.Shutdown)
 	return c
 }
@@ -254,6 +256,31 @@ func TestReadyReverseProxy(t *testing.T) {
 	}
 	if body["id"] != "mock" {
 		t.Fatalf("body=%v", body)
+	}
+}
+
+func TestReconcileLoadingThenEnsureReady(t *testing.T) {
+	s, err := mock.New("A", mock.WithInitialLoading())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c := newClient(t, s, testModel(s.URL()), ClientOptions{})
+	if err := c.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.State() != StateStarting {
+		t.Fatalf("state=%s", c.State())
+	}
+	s.ForceReady()
+	if err := c.EnsureReady(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if c.State() != StateReady {
+		t.Fatalf("state=%s", c.State())
+	}
+	if s.Counts().LoadStarts != 0 {
+		t.Fatalf("load starts=%d", s.Counts().LoadStarts)
 	}
 }
 
@@ -545,5 +572,40 @@ func TestPrepareTimeoutAndNoBlindRerun(t *testing.T) {
 	}
 	if rec.Runs() != 1 {
 		t.Fatalf("rerun=%d", rec.Runs())
+	}
+}
+
+func TestNilLoadGateRefuses(t *testing.T) {
+	s, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c := NewClient(context.Background(), testModel(s.URL()), testGlobals(), ClientOptions{})
+	t.Cleanup(c.Shutdown)
+	err = c.EnsureReady(context.Background(), time.Second)
+	if !errors.Is(err, errAdmissionRequired) {
+		t.Fatalf("err=%v", err)
+	}
+	if s.Counts().LoadStarts != 0 {
+		t.Fatal("load ran without admission")
+	}
+}
+
+func TestEnsureReadyUsesCallerTimeout(t *testing.T) {
+	gate := testkit.NewBarrier()
+	s, err := mock.New("A", mock.WithLoadGate(gate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c := newClient(t, s, testModel(s.URL()), ClientOptions{})
+	start := time.Now()
+	err = c.EnsureReady(context.Background(), 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected load timeout")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("caller timeout ignored, took %s", time.Since(start))
 	}
 }

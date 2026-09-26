@@ -30,10 +30,16 @@ func newTestStack(t *testing.T, a, b *mock.Server) http.Handler {
 			"model-a": {
 				ID: "model-a", Name: "A", BaseURL: a.URL(), Aliases: []string{"alias-a"},
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
+				InferencePaths:  []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/audio/transcriptions", "/align"},
+				MaxBodyBytes:    32 << 20,
+				ResourceProfile: config.ResourceProfile{ProfileID: "a", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
 			"model-b": {
 				ID: "model-b", Name: "B", BaseURL: b.URL(),
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second, Unlisted: true,
+				InferencePaths:  []string{"/v1/chat/completions", "/align"},
+				MaxBodyBytes:    32 << 20,
+				ResourceProfile: config.ResourceProfile{ProfileID: "b", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
 		},
 	}
@@ -42,6 +48,9 @@ func newTestStack(t *testing.T, a, b *mock.Server) http.Handler {
 		"model-b": runtime.NewClient(context.Background(), cfg.Models["model-b"], cfg, runtime.ClientOptions{}),
 	}
 	rt := router.NewExclusive(cfg, runtimes, nil)
+	if err := rt.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -162,11 +171,10 @@ func TestModelsHidesUnlistedAndDistinguishesState(t *testing.T) {
 	}
 	item := data[0].(map[string]any)
 	st := item["status"].(map[string]any)
-	if st["state"] == "unloaded" && st["ready"] == false {
-		t.Fatal("ready=false must not be collapsed to unloaded")
+	if st["state"] == "unloaded" {
+		t.Fatal("local stopped must not be reported as unloaded")
 	}
-	if st["state"] != "unknown" && st["ready"] != nil {
-		// initial client state is unknown; ready should be null not false-as-unloaded
+	if st["state"] != "stopped" || st["ready"] != false || st["residency"] != "not_resident" {
 		t.Fatalf("status=%v", st)
 	}
 }
@@ -188,6 +196,56 @@ func TestHealthIsProcessLiveness(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("code=%d", w.Code)
+	}
+}
+
+func TestAlignStripsModelQuery(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	h := newTestStack(t, a, b)
+	body := []byte(`{"audio":"x"}`)
+	req := httptest.NewRequest(http.MethodPost, "/align?model=model-b&x=1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
+	}
+	if b.LastPath() != "/align?x=1" {
+		t.Fatalf("backend path=%s", b.LastPath())
+	}
+	if a.Counts().LoadStarts != 0 {
+		t.Fatal("A should stay unloaded when B fits")
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	h := newTestStack(t, a, b)
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions?model=alias-a", bytes.NewReader([]byte(`{"model":"alias-a"}`)))
+	req.ContentLength = 32<<20 + 1
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
 	}
 }
 

@@ -1,4 +1,4 @@
-listen: ":8080"
+listen: ":8095"
 logLevel: info
 healthCheckTimeout: 120
 unloadTimeout: 30
@@ -9,6 +9,12 @@ drainTimeout: 180
 shutdownTimeout: 60
 maxQueueSize: 256
 preload: []
+
+gpu:
+  # This host: nvidia-smi -L → NVIDIA GeForce RTX 3090.
+  device: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
+  safetyMarginBytes: 1073741824
+  maxObservationAge: 5
 
 models:
   qwen3.8-27b:
@@ -23,6 +29,59 @@ models:
       prepareTimeout: 60
       healthCheckTimeout: 120
       unloadTimeout: 30
+    resourceProfile:
+      profileId: example-chat
+      # Not a measurement. Do not treat 0 as a verified residual.
+      loadPeakBytes: 1073741824
+      inferencePeakBytes: 1073741824
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+      limits:
+        note: replace with a measured profile before production use
+    inferencePaths:
+      - /v1/chat/completions
+      - /v1/completions
+    maxBodyBytes: 33554432
   qwen-asr:
-    baseURL: "http://127.0.0.1:8001"
+    baseURL: "http://127.0.0.1:8080"
     name: "Qwen ASR"
+    aliases: [qwen3-asr]
+    prepare:
+      argv: ["/home/kjh/workspace/qwen-asr-vllm-docker-config/prepare-inferswap"]
+    resourceProfile:
+      profileId: rtx3090-asr-2026-09-26
+      # Host nvidia-smi total used. Three load/transcribe/unload rounds.
+      # Observed max load 20011 MiB, inference 20015 MiB. Plus 1 GiB slack.
+      # Unload returned to the ~1.4 GiB host baseline and did not grow, so residual 0 is measured.
+      loadPeakBytes: 22060990464
+      inferencePeakBytes: 22060990464
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+      limits:
+        input: "1s 16kHz mono PCM16 silence"
+        rounds: 3
+        measuredOn: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
+    inferencePaths:
+      - /v1/audio/transcriptions
+    maxBodyBytes: 67108864
+  qwen-fa:
+    baseURL: "http://127.0.0.1:8090"
+    name: "Qwen FA"
+    prepare:
+      argv: ["/home/kjh/workspace/qwen-fa-docker-config/prepare-inferswap"]
+    resourceProfile:
+      profileId: rtx3090-fa-2026-09-26
+      # Host nvidia-smi total used. Three load/align/unload rounds.
+      # Observed max load 3229 MiB, align 3256 MiB. Plus 1 GiB slack.
+      # Unload returned to the host baseline and did not grow, so residual 0 is measured.
+      loadPeakBytes: 4487905280
+      inferencePeakBytes: 4487905280
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+      limits:
+        input: "1s 16kHz mono PCM16, one Korean chunk"
+        rounds: 3
+        measuredOn: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
+    inferencePaths:
+      - /align
+    maxBodyBytes: 67108864

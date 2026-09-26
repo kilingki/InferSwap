@@ -235,6 +235,53 @@ func TestDisconnectKeepsBackendActive(t *testing.T) {
 	t.Fatalf("active never dropped: %v", s.Snapshot().ActiveRequests)
 }
 
+func TestCancelDuringBackendKeepsActive(t *testing.T) {
+	infer := testkit.NewBarrier()
+	backend := testkit.NewBarrier()
+	s, err := New("A", WithInferGate(infer), WithBackendGate(backend), WithPersistInference())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	loadOK(t, s.URL())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.URL()+"/v1/chat/completions", bytes.NewBufferString(`{}`))
+		_, err := http.DefaultClient.Do(req)
+		done <- err
+	}()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := infer.WaitStarted(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	infer.Release()
+	if err := backend.WaitStarted(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return after cancel")
+	}
+	if s.Snapshot().ActiveRequests != 1 {
+		t.Fatalf("active before backend release=%d", s.Snapshot().ActiveRequests)
+	}
+	backend.Release()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if s.Snapshot().ActiveRequests == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("active never dropped: %d", s.Snapshot().ActiveRequests)
+}
+
 func TestPrepareOpensDownEndpoint(t *testing.T) {
 	gate := testkit.NewBarrier()
 	s, err := New("A", WithEndpointDown(), WithPrepareGate(gate))

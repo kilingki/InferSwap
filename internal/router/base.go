@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/kilingki/InferSwap/internal/config"
+	"github.com/kilingki/InferSwap/internal/resource"
 	"github.com/kilingki/InferSwap/internal/router/scheduler"
 	"github.com/kilingki/InferSwap/internal/runtime"
 	"github.com/kilingki/InferSwap/internal/testkit"
@@ -40,11 +42,52 @@ type Router struct {
 	runDone         chan struct{}
 	lastStatus      map[string]runtime.Status
 	nextReq         atomic.Uint64
+
+	observer    resource.Observer
+	device      string
+	snap        resource.Snapshot
+	observeCh   chan resource.Snapshot
+	reserved    map[string]int64
+	lastUse     map[string]time.Time
+	loadedAt    map[string]time.Time
+	loadSerial     string
+	bootGPU        bool
+	admitCh        chan admitReq
+	unconfirmed    []string
+	residualAfter  map[string]time.Time
+	unloadNoticeCh chan unloadNotice
+	syncCh         chan func()
+}
+
+type admitReq struct {
+	model string
+	resp  chan error
+}
+
+type unloadNotice struct {
+	ev     scheduler.UnloadDone
+	sample resource.Snapshot
+	at     time.Time
 }
 
 func NewExclusive(cfg *config.Config, runtimes map[string]runtime.Runtime, clock testkit.Clock) *Router {
+	return New(cfg, runtimes, clock, nil)
+}
+
+func New(cfg *config.Config, runtimes map[string]runtime.Runtime, clock testkit.Clock, obs resource.Observer) *Router {
 	if clock == nil {
 		clock = testkit.RealClock{}
+	}
+	device := "fake"
+	if cfg != nil && cfg.GPU.Device != "" {
+		device = cfg.GPU.Device
+	}
+	if obs == nil {
+		if cfg != nil && cfg.GPU.Device != "" {
+			obs = resource.NVML{Device: cfg.GPU.Device}
+		} else {
+			obs = resource.Generous(device)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Router{
@@ -66,33 +109,84 @@ func NewExclusive(cfg *config.Config, runtimes map[string]runtime.Runtime, clock
 		shutdownCh:      make(chan chan struct{}),
 		runDone:         make(chan struct{}),
 		lastStatus:      map[string]runtime.Status{},
+		observer:        obs,
+		reserved:        map[string]int64{},
+		lastUse:         map[string]time.Time{},
+		loadedAt:        map[string]time.Time{},
+		admitCh:         make(chan admitReq),
+		device:          device,
+		observeCh:       make(chan resource.Snapshot, 1),
+		residualAfter:   map[string]time.Time{},
+		unloadNoticeCh:  make(chan unloadNotice),
+		syncCh:          make(chan func()),
 	}
-	r.schedule = scheduler.NewFIFO(cfg, exclusiveSwapper{}, r)
+	r.schedule = scheduler.NewFIFO(cfg, r, r)
+	r.schedule.UseNow(r.clock.Now)
+	for id, rt := range runtimes {
+		if c, ok := rt.(*runtime.Client); ok {
+			modelID := id
+			c.SetLoadGate(func(ctx context.Context) error { return r.WaitLoad(ctx, modelID) })
+		}
+	}
+	if snap, err := obs.Observe(); err == nil && snap.DeviceID == device && resource.Fresh(snap, time.Now(), r.observeAge()) {
+		r.snap = snap
+		r.bootGPU = true
+	}
+	go r.pollGPU()
 	go r.run()
 	return r
+}
+
+func (r *Router) pollGPU() {
+	for {
+		snap, err := r.observer.Observe()
+		if err != nil || !snap.OK || snap.DeviceID != r.device {
+			snap = resource.Snapshot{}
+		}
+		select {
+		case r.observeCh <- snap:
+		case <-r.shutdownCtx.Done():
+			return
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-r.shutdownCtx.Done():
+			return
+		}
+	}
 }
 
 func (r *Router) run() {
 	defer close(r.runDone)
 	for {
 		select {
+		case <-r.shutdownCtx.Done():
+			return
 		case done := <-r.shutdownCh:
 			r.schedule.OnShutdown(scheduler.ErrShutdown)
 			if done != nil {
 				close(done)
 			}
-			return
 		case req := <-r.handlerCh:
 			r.schedule.OnRequest(req)
 		case req := <-r.cancelCh:
 			r.schedule.OnCancel(req)
 		case ev := <-r.unloadDoneCh:
-			r.schedule.OnUnloadDone(ev)
+			r.finishUnload(unloadNotice{ev: ev})
+		case notice := <-r.unloadNoticeCh:
+			r.finishUnload(notice)
 		case ev := <-r.swapDoneCh:
+			if ev.Err == nil {
+				r.noteLoaded(ev.ModelID)
+			}
+			if r.loadSerial == ev.ModelID {
+				r.loadSerial = ""
+			}
 			r.schedule.OnSwapDone(ev)
 		case ev := <-r.serveDoneCh:
+			r.noteUse(ev.ModelID)
 			r.schedule.OnServeDone(ev)
-			go r.refreshStatus(ev.ModelID)
+			go r.refreshStatus(ev.ModelID, r.schedule.ProofGen(ev.ModelID))
 		case ev := <-r.proxyStartCh:
 			r.schedule.OnProxyStart(ev)
 		case ev := <-r.cancelGrantedCh:
@@ -106,11 +200,60 @@ func (r *Router) run() {
 			r.schedule.OnBackendDone(ev)
 		case req := <-r.timeoutCh:
 			r.schedule.OnQueueTimeout(req)
+		case req := <-r.admitCh:
+			req.resp <- r.grantLoad(req.model)
+		case snap := <-r.observeCh:
+			r.applyObservation(snap)
+		case fn := <-r.syncCh:
+			fn()
 		}
 	}
 }
 
-func (r *Router) refreshStatus(id string) {
+func (r *Router) onLoop(fn func()) {
+	done := make(chan struct{})
+	select {
+	case r.syncCh <- func() {
+		defer close(done)
+		fn()
+	}:
+	case <-r.shutdownCtx.Done():
+		return
+	}
+	select {
+	case <-done:
+	case <-r.shutdownCtx.Done():
+	}
+}
+
+func (r *Router) applyObservation(snap resource.Snapshot) {
+	if !snap.OK || snap.DeviceID != r.device {
+		r.snap = resource.Snapshot{}
+		r.bootGPU = false
+		return
+	}
+	r.snap = snap
+	r.bootGPU = true
+	for id, at := range r.residualAfter {
+		if snap.ObservedAt.After(at) {
+			r.holdResidual(id)
+			delete(r.residualAfter, id)
+		}
+	}
+}
+
+func (r *Router) finishUnload(notice unloadNotice) {
+	ev := notice.ev
+	if ev.Err == nil {
+		for _, id := range ev.IDs {
+			r.residualAfter[id] = notice.at
+		}
+		r.applyObservation(notice.sample)
+	}
+	r.schedule.OnUnloadDone(ev)
+}
+
+func (r *Router) refreshStatus(id string, gen uint64) {
 	rt, ok := r.runtimes[id]
 	if !ok {
 		return
@@ -119,7 +262,7 @@ func (r *Router) refreshStatus(id string) {
 	defer cancel()
 	st, err := rt.Status(ctx)
 	select {
-	case r.statusCh <- scheduler.StatusEvent{ModelID: id, Status: st, Err: err}:
+	case r.statusCh <- scheduler.StatusEvent{ModelID: id, Status: st, Err: err, Gen: gen}:
 	case <-r.shutdownCtx.Done():
 	}
 }
@@ -155,13 +298,38 @@ func (r *Router) LastStatus(modelID string) (runtime.Status, bool) {
 	return st, ok
 }
 
-func (r *Router) StartUnload(ids []string) {
+func (r *Router) Remind(at time.Time) {
+	d := at.Sub(r.clock.Now())
+	go func() {
+		select {
+		case <-r.clock.After(d):
+		case <-r.shutdownCtx.Done():
+			return
+		}
+		select {
+		case r.syncCh <- func() { r.schedule.OnRemind() }:
+		case <-r.shutdownCtx.Done():
+		}
+	}()
+}
+
+func (r *Router) StartUnload(ids []string, deadline time.Time) {
+	if deadline.IsZero() {
+		deadline = r.clock.Now().Add(r.drainBudget())
+	}
 	go func() {
 		var first error
+		var at time.Time
 		for _, id := range ids {
 			rt, ok := r.runtimes[id]
 			if !ok {
 				continue
+			}
+			if err := r.waitIdle(rt, deadline); err != nil {
+				if first == nil {
+					first = err
+				}
+				break
 			}
 			to := time.Second
 			if m, ok := r.cfg.Models[id]; ok && m.UnloadTimeout > 0 {
@@ -171,13 +339,82 @@ func (r *Router) StartUnload(ids []string) {
 			}
 			if err := rt.Stop(context.Background(), to); err != nil && first == nil {
 				first = err
+				break
 			}
+			at = r.clock.Now()
+		}
+		if first != nil || at.IsZero() {
+			if first == nil {
+				first = fmt.Errorf("unload did not complete")
+			}
+			r.sendUnload(unloadNotice{ev: scheduler.UnloadDone{IDs: ids, Err: first}})
+			return
+		}
+		snap, serr := r.sampleAfter(at)
+		notice := unloadNotice{ev: scheduler.UnloadDone{IDs: ids}, at: at, sample: snap}
+		if serr != nil {
+			notice.ev.Err = serr
+		}
+		r.sendUnload(notice)
+	}()
+}
+
+func (r *Router) sendUnload(notice unloadNotice) {
+	select {
+	case r.unloadNoticeCh <- notice:
+	case <-r.shutdownCtx.Done():
+	}
+}
+
+func (r *Router) sampleAfter(after time.Time) (resource.Snapshot, error) {
+	deadline := r.clock.Now().Add(r.drainBudget())
+	for {
+		snap, err := r.observer.Observe()
+		if err == nil && snap.OK && snap.DeviceID == r.device && snap.ObservedAt.After(after) {
+			return snap, nil
+		}
+		if !r.clock.Now().Before(deadline) {
+			return resource.Snapshot{}, fmt.Errorf("gpu sample after unload not observed")
 		}
 		select {
-		case r.unloadDoneCh <- scheduler.UnloadDone{IDs: ids, Err: first}:
+		case <-time.After(20 * time.Millisecond):
 		case <-r.shutdownCtx.Done():
+			return resource.Snapshot{}, scheduler.ErrShutdown
 		}
-	}()
+	}
+}
+
+func (r *Router) waitIdle(rt runtime.Runtime, deadline time.Time) error {
+	for {
+		if !time.Now().Before(deadline) {
+			return scheduler.ErrDrainTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), r.statusTimeout())
+		st, err := rt.Status(ctx)
+		cancel()
+		if err == nil && st.ActiveRequests == 0 && st.State != runtime.WireLoading && st.State != runtime.WireUnloading {
+			return nil
+		}
+		if err != nil || !time.Now().Before(deadline) {
+			return scheduler.ErrDrainTimeout
+		}
+		wait := time.Second
+		if until := time.Until(deadline); until < wait {
+			wait = until
+		}
+		select {
+		case <-time.After(wait):
+		case <-r.shutdownCtx.Done():
+			return scheduler.ErrShutdown
+		}
+	}
+}
+
+func (r *Router) drainBudget() time.Duration {
+	if r.cfg != nil && r.cfg.DrainTimeout > 0 {
+		return r.cfg.DrainTimeout
+	}
+	return 180 * time.Second
 }
 
 func (r *Router) StartLoad(modelID string) {
@@ -397,9 +634,13 @@ func (r *Router) Remaining() []string {
 	return left
 }
 
+func (r *Router) Unconfirmed() []string {
+	out := append([]string{}, r.unconfirmed...)
+	return out
+}
+
 func (r *Router) Shutdown(ctx context.Context) error {
 	r.shutting.Store(true)
-	r.shutdownFn()
 	done := make(chan struct{})
 	select {
 	case r.shutdownCh <- done:
@@ -411,30 +652,81 @@ func (r *Router) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	var wg sync.WaitGroup
-	for _, rt := range r.runtimes {
-		wg.Add(1)
-		go func(rt runtime.Runtime) {
-			defer wg.Done()
-			to := time.Second
-			if r.cfg != nil && r.cfg.ShutdownTimeout > 0 {
-				to = r.cfg.ShutdownTimeout
-			}
-			_ = rt.Stop(context.Background(), to)
-			rt.Shutdown()
-		}(rt)
+	var failed []string
+	for id, rt := range r.runtimes {
+		if err := r.releaseOnShutdown(ctx, id, rt); err != nil {
+			failed = append(failed, id)
+		}
 	}
-	finished := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(finished)
-	}()
+	sort.Strings(failed)
+	r.onLoop(func() { r.unconfirmed = append([]string{}, failed...) })
+	r.shutdownFn()
 	select {
-	case <-finished:
-		return nil
+	case <-r.runDone:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	for _, rt := range r.runtimes {
+		rt.Shutdown()
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("unconfirmed models: %s", strings.Join(failed, ","))
+	}
+	return nil
+}
+
+func (r *Router) releaseOnShutdown(ctx context.Context, id string, rt runtime.Runtime) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(r.drainBudget())
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var protected bool
+		r.onLoop(func() { protected = r.schedule.Protected(id) })
+		if !protected {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%s still executing", id)
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	switch rt.State() {
+	case runtime.StateStopped, runtime.StateShutdown:
+		return nil
+	case runtime.StateUnknown, runtime.StateFailed, runtime.StateStarting, runtime.StateStopping:
+		return fmt.Errorf("%s state %s", id, rt.State())
+	}
+	if err := r.waitIdle(rt, deadline); err != nil {
+		return err
+	}
+	to := time.Second
+	if r.cfg != nil && r.cfg.ShutdownTimeout > 0 {
+		to = r.cfg.ShutdownTimeout
+	}
+	if err := rt.Stop(ctx, to); err != nil {
+		return err
+	}
+	at := r.clock.Now()
+	snap, err := r.sampleAfter(at)
+	if err != nil {
+		return err
+	}
+	r.onLoop(func() {
+		r.residualAfter[id] = at
+		r.applyObservation(snap)
+	})
+	return nil
 }
 
 func writeErr(w http.ResponseWriter, err error) {

@@ -20,6 +20,8 @@ type stubRT struct {
 	ensures int
 	stops   int
 	status  runtime.Status
+	entered chan struct{}
+	release chan struct{}
 }
 
 func (s *stubRT) Reconcile(ctx context.Context) error { return nil }
@@ -57,6 +59,16 @@ func (s *stubRT) State() runtime.State {
 }
 
 func (s *stubRT) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.entered != nil {
+		select {
+		case <-s.entered:
+		default:
+			close(s.entered)
+		}
+	}
+	if s.release != nil {
+		<-s.release
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, string(s.State()))
 }

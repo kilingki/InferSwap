@@ -1,6 +1,9 @@
 package scheduler
 
 import (
+	"errors"
+	"time"
+
 	"github.com/kilingki/InferSwap/internal/config"
 	"github.com/kilingki/InferSwap/internal/runtime"
 )
@@ -22,10 +25,17 @@ type FIFO struct {
 	nextID uint64
 	queued []HandlerReq
 
-	pending    map[string]int
-	httpIn     map[string]int
-	backend    map[string]int
+	pending     map[string]int
+	httpIn      map[string]int
+	backend     map[string]int
+	unresolved  map[string]int
+	dispatchGen map[string]uint64
+	quietGen    map[string]uint64
 	gateClosed map[string]bool
+	gateAt     map[string]time.Time
+	drain      time.Duration
+	drainArmed bool
+	now        func() time.Time
 	unloadFail map[string]bool
 
 	phase       phase
@@ -37,9 +47,13 @@ type FIFO struct {
 func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
 	limits := map[string]int{}
 	maxQ := 256
+	drain := 180 * time.Second
 	if cfg != nil {
 		if cfg.MaxQueueSize > 0 {
 			maxQ = cfg.MaxQueueSize
+		}
+		if cfg.DrainTimeout > 0 {
+			drain = cfg.DrainTimeout
 		}
 		for id, m := range cfg.Models {
 			lim := m.ConcurrencyLimit
@@ -54,11 +68,23 @@ func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
 		effects:    effects,
 		limits:     limits,
 		maxQ:       maxQ,
-		pending:    map[string]int{},
-		httpIn:     map[string]int{},
-		backend:    map[string]int{},
-		gateClosed: map[string]bool{},
+		pending:     map[string]int{},
+		httpIn:      map[string]int{},
+		backend:     map[string]int{},
+		unresolved:  map[string]int{},
+		dispatchGen: map[string]uint64{},
+		quietGen:    map[string]uint64{},
+		gateClosed:  map[string]bool{},
+		gateAt:      map[string]time.Time{},
+		drain:       drain,
+		now:         time.Now,
 		unloadFail: map[string]bool{},
+	}
+}
+
+func (s *FIFO) UseNow(now func() time.Time) {
+	if now != nil {
+		s.now = now
 	}
 }
 
@@ -133,6 +159,10 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 		if s.httpIn[ev.ModelID] == 0 {
 			delete(s.httpIn, ev.ModelID)
 		}
+		s.unresolved[ev.ModelID]++
+		if s.pending[ev.ModelID] == 0 && s.httpIn[ev.ModelID] == 0 {
+			s.quietGen[ev.ModelID] = s.dispatchGen[ev.ModelID]
+		}
 	}
 	s.tryDispatch()
 }
@@ -145,7 +175,14 @@ func (s *FIFO) OnStatus(ev StatusEvent) {
 	if s.backend[ev.ModelID] <= 0 {
 		delete(s.backend, ev.ModelID)
 	}
+	if ev.Status.ActiveRequests == 0 && s.pending[ev.ModelID] == 0 && s.httpIn[ev.ModelID] == 0 && ev.Gen != 0 && ev.Gen == s.dispatchGen[ev.ModelID] && ev.Gen == s.quietGen[ev.ModelID] {
+		delete(s.unresolved, ev.ModelID)
+	}
 	s.tryDispatch()
+}
+
+func (s *FIFO) ProofGen(model string) uint64 {
+	return s.quietGen[model]
 }
 
 func (s *FIFO) OnBackendDone(ev BackendDoneEvent) {
@@ -159,33 +196,33 @@ func (s *FIFO) OnUnloadDone(ev UnloadDone) {
 	}
 	if ev.Err != nil {
 		for _, id := range s.swapEvict {
-			s.unloadFail[id] = true
+			if !errors.Is(ev.Err, ErrDrainTimeout) {
+				s.unloadFail[id] = true
+			}
 		}
 		s.phase = phaseIdle
 		s.unloadBegan = false
 		if len(s.queued) > 0 {
 			head := s.queued[0]
 			s.queued = s.queued[1:]
-			s.effects.GrantError(head, ErrUnloadBlocked)
+			if errors.Is(ev.Err, ErrDrainTimeout) {
+				s.effects.GrantError(head, ErrDrainTimeout)
+			} else {
+				s.effects.GrantError(head, ErrUnloadBlocked)
+			}
 		}
 		s.tryDispatch()
 		return
 	}
 	for _, id := range s.swapEvict {
-		delete(s.gateClosed, id)
+		s.openGate(id)
 	}
-	needLoad := len(s.queued) > 0 && s.queued[0].Model == s.swapTarget
-	if !needLoad {
-		s.phase = phaseIdle
-		s.unloadBegan = false
-		s.swapTarget = ""
-		s.swapEvict = nil
-		s.reopenUnusedGates()
-		s.tryDispatch()
-		return
-	}
-	s.phase = phaseLoading
-	s.effects.StartLoad(s.swapTarget)
+	s.phase = phaseIdle
+	s.unloadBegan = false
+	s.swapTarget = ""
+	s.swapEvict = nil
+	s.reopenUnusedGates()
+	s.tryDispatch()
 }
 
 func (s *FIFO) OnSwapDone(ev SwapDone) {
@@ -201,11 +238,21 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 		if len(s.queued) > 0 && s.queued[0].Model == target {
 			head := s.queued[0]
 			s.queued = s.queued[1:]
-			s.effects.GrantError(head, ErrLoadFailed)
+			grantErr := error(ErrLoadFailed)
+			var se *Error
+			if errors.As(ev.Err, &se) {
+				grantErr = se
+			}
+			s.effects.GrantError(head, grantErr)
 		}
 		s.tryDispatch()
 		return
 	}
+	s.tryDispatch()
+}
+
+func (s *FIFO) OnRemind() {
+	s.drainArmed = false
 	s.tryDispatch()
 }
 
@@ -237,14 +284,28 @@ func (s *FIFO) tryDispatch() {
 
 	running := s.runningIDs()
 	evict := []string{}
-	if s.planner != nil {
+	if d, ok := s.planner.(Decider); ok {
+		var err error
+		evict, err = d.Decide(head.Model, running)
+		if err != nil {
+			s.queued = s.queued[1:]
+			s.effects.GrantError(head, err)
+			s.tryDispatch()
+			return
+		}
+	} else if s.planner != nil {
 		evict = s.planner.EvictionFor(head.Model, running)
 	}
 	for _, v := range evict {
-		s.gateClosed[v] = true
+		s.closeGate(v)
 	}
 	if len(evict) > 0 {
+		if s.drainExpired(evict) {
+			s.failDrain(head, evict)
+			return
+		}
 		if s.anyBusy(evict) {
+			s.armDrain(evict)
 			return
 		}
 		for _, v := range evict {
@@ -259,7 +320,8 @@ func (s *FIFO) tryDispatch() {
 		s.swapTarget = head.Model
 		s.swapEvict = append([]string{}, evict...)
 		s.unloadBegan = true
-		s.effects.StartUnload(evict)
+		s.drainArmed = false
+		s.effects.StartUnload(evict, s.drainDeadline(evict))
 		return
 	}
 
@@ -278,6 +340,8 @@ func (s *FIFO) grantHead() {
 	head := s.queued[0]
 	s.queued = s.queued[1:]
 	if s.effects.GrantServe(head, head.Model) {
+		s.dispatchGen[head.Model]++
+		delete(s.quietGen, head.Model)
 		s.pending[head.Model]++
 		return
 	}
@@ -301,9 +365,68 @@ func (s *FIFO) reopenUnusedGates() {
 	}
 	for id := range s.gateClosed {
 		if !need[id] && !(s.unloadBegan && s.phase != phaseIdle) {
-			delete(s.gateClosed, id)
+			s.openGate(id)
 		}
 	}
+}
+
+func (s *FIFO) closeGate(id string) {
+	if !s.gateClosed[id] {
+		s.gateAt[id] = s.now()
+	}
+	s.gateClosed[id] = true
+}
+
+func (s *FIFO) openGate(id string) {
+	delete(s.gateClosed, id)
+	delete(s.gateAt, id)
+}
+
+func (s *FIFO) drainDeadline(ids []string) time.Time {
+	deadline := s.now().Add(s.drain)
+	for _, id := range ids {
+		at, ok := s.gateAt[id]
+		if !ok {
+			continue
+		}
+		end := at.Add(s.drain)
+		if end.Before(deadline) {
+			deadline = end
+		}
+	}
+	return deadline
+}
+
+func (s *FIFO) drainExpired(ids []string) bool {
+	if s.drain <= 0 {
+		return false
+	}
+	now := s.now()
+	for _, id := range ids {
+		at, ok := s.gateAt[id]
+		if ok && !now.Before(at.Add(s.drain)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *FIFO) armDrain(ids []string) {
+	if s.drainArmed {
+		return
+	}
+	s.drainArmed = true
+	s.effects.Remind(s.drainDeadline(ids))
+}
+
+func (s *FIFO) failDrain(head HandlerReq, evict []string) {
+	for _, id := range evict {
+		s.openGate(id)
+	}
+	s.drainArmed = false
+	s.queued = s.queued[1:]
+	s.effects.GrantError(head, ErrDrainTimeout)
+	s.tryDispatch()
 }
 
 func (s *FIFO) runningIDs() []string {
@@ -332,15 +455,19 @@ func (s *FIFO) runningIDs() []string {
 
 func (s *FIFO) anyBusy(ids []string) bool {
 	for _, id := range ids {
-		if s.pending[id]+s.httpIn[id]+s.backend[id] > 0 {
+		if s.pending[id]+s.httpIn[id]+s.unresolved[id]+s.backend[id] > 0 {
 			return true
 		}
 	}
 	return false
 }
 
+func (s *FIFO) Protected(id string) bool {
+	return s.pending[id]+s.httpIn[id]+s.unresolved[id]+s.backend[id] > 0
+}
+
 func (s *FIFO) slots(model string) int {
-	return s.pending[model] + s.httpIn[model] + s.backend[model]
+	return s.pending[model] + s.httpIn[model] + s.unresolved[model]
 }
 
 func (s *FIFO) limit(model string) int {

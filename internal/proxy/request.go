@@ -1,12 +1,12 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -26,31 +26,37 @@ var (
 )
 
 func ExtractModel(r *http.Request) (string, error) {
-	if q := r.URL.Query().Get("model"); q != "" && r.Method == http.MethodGet {
+	return ExtractModelLimited(r, MaxBodyBytes)
+}
+
+func ExtractModelLimited(r *http.Request, limit int64) (string, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if q := r.URL.Query().Get("model"); q != "" {
+		if r.ContentLength > limit {
+			return "", ErrBodyTooLarge
+		}
 		return q, nil
 	}
 	if r.Body == nil {
-		if q := r.URL.Query().Get("model"); q != "" {
-			return q, nil
-		}
 		return "", ErrNoModel
 	}
-	if r.ContentLength > MaxBodyBytes {
+	if r.ContentLength > limit {
 		return "", ErrBodyTooLarge
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, MaxBodyBytes+1))
+	spool, err := spoolBody(r.Body, limit)
 	if err != nil {
-		return "", fmt.Errorf("read body: %w", err)
+		return "", err
 	}
-	if int64(len(body)) > MaxBodyBytes {
-		return "", ErrBodyTooLarge
+	fail := func(err error) (string, error) {
+		_ = spool.Close()
+		return "", err
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
-	if q := r.URL.Query().Get("model"); q != "" {
-		return q, nil
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
 	}
-
+	r.Body = spool
 	ct := r.Header.Get("Content-Type")
 	media, _, _ := mime.ParseMediaType(ct)
 	switch {
@@ -58,35 +64,72 @@ func ExtractModel(r *http.Request) (string, error) {
 		var tmp struct {
 			Model string `json:"model"`
 		}
-		if len(bytes.TrimSpace(body)) == 0 {
-			return "", ErrNoModel
-		}
-		if err := json.Unmarshal(body, &tmp); err != nil {
-			return "", &ExtractError{Status: http.StatusBadRequest, Code: "BAD_REQUEST", Msg: "invalid JSON"}
+		dec := json.NewDecoder(spool)
+		if err := dec.Decode(&tmp); err != nil {
+			return fail(&ExtractError{Status: http.StatusBadRequest, Code: "BAD_REQUEST", Msg: "invalid JSON"})
 		}
 		if tmp.Model == "" {
-			return "", ErrNoModel
+			return fail(ErrNoModel)
+		}
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			return fail(err)
 		}
 		return tmp.Model, nil
 	case strings.Contains(ct, "multipart/form-data"):
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		if err := r.ParseMultipartForm(MaxBodyBytes); err != nil {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			return "", &ExtractError{Status: http.StatusBadRequest, Code: "BAD_REQUEST", Msg: "invalid multipart body"}
+		if err := r.ParseMultipartForm(limit); err != nil {
+			return fail(&ExtractError{Status: http.StatusBadRequest, Code: "BAD_REQUEST", Msg: "invalid multipart body"})
 		}
 		model := r.FormValue("model")
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
 		r.MultipartForm = nil
 		r.Form = nil
 		r.PostForm = nil
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			return fail(err)
+		}
+		r.Body = spool
 		if model == "" {
-			return "", ErrNoModel
+			return fail(ErrNoModel)
 		}
 		return model, nil
 	default:
-		if q := r.URL.Query().Get("model"); q != "" {
-			return q, nil
-		}
-		return "", ErrNoModel
+		return fail(ErrNoModel)
 	}
+}
+
+type spoolFile struct {
+	*os.File
+	path string
+}
+
+func (s *spoolFile) Close() error {
+	if s.File == nil {
+		return nil
+	}
+	err := s.File.Close()
+	s.File = nil
+	if rmErr := os.Remove(s.path); err == nil {
+		err = rmErr
+	}
+	return err
+}
+
+func spoolBody(src io.Reader, limit int64) (*spoolFile, error) {
+	f, err := os.CreateTemp("", "inferswap-body-*")
+	if err != nil {
+		return nil, err
+	}
+	spool := &spoolFile{File: f, path: f.Name()}
+	n, err := io.Copy(spool, io.LimitReader(src, limit+1))
+	if err != nil {
+		_ = spool.Close()
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if n > limit {
+		_ = spool.Close()
+		return nil, ErrBodyTooLarge
+	}
+	return spool, nil
 }

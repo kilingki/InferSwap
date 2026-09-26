@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/kilingki/InferSwap/internal/config"
 	"github.com/kilingki/InferSwap/internal/runtime"
@@ -52,9 +53,11 @@ func (f *fakeEffects) LastStatus(id string) (runtime.Status, bool) {
 	return st, ok
 }
 
-func (f *fakeEffects) StartUnload(ids []string) {
+func (f *fakeEffects) StartUnload(ids []string, deadline time.Time) {
 	f.unloads = append(f.unloads, append([]string{}, ids...))
 }
+
+func (f *fakeEffects) Remind(at time.Time) {}
 func (f *fakeEffects) StartLoad(modelID string) { f.loads = append(f.loads, modelID) }
 
 func (f *fakeEffects) GrantError(req HandlerReq, err error) {
@@ -120,7 +123,7 @@ func TestAInFlightThenBSwap(t *testing.T) {
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	f.status["A"] = runtime.Status{ActiveRequests: 0}
-	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"], Gen: s.ProofGen("A")})
 	if len(f.unloads) != 1 {
 		t.Fatalf("unloads=%v", f.unloads)
 	}
@@ -148,7 +151,7 @@ func TestNoReadyFastPathOverEarlierWaiter(t *testing.T) {
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	f.status["A"] = runtime.Status{ActiveRequests: 0}
-	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"], Gen: s.ProofGen("A")})
 	f.states["A"] = runtime.StateStopped
 	s.OnUnloadDone(UnloadDone{IDs: []string{"A"}})
 	f.states["B"] = runtime.StateReady
@@ -216,7 +219,7 @@ func TestCancelDoesNotStartLoad(t *testing.T) {
 	s.OnCancel(req(2, "B"))
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	f.status["A"] = runtime.Status{ActiveRequests: 0}
-	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"], Gen: s.ProofGen("A")})
 	if len(f.unloads) != 0 || len(f.loads) != 0 {
 		t.Fatalf("cancel caused swap unloads=%v loads=%v", f.unloads, f.loads)
 	}
@@ -232,7 +235,7 @@ func TestBNotStarvedByContinuousA(t *testing.T) {
 	s.OnRequest(req(4, "A"))
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	f.status["A"] = runtime.Status{ActiveRequests: 0}
-	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"], Gen: s.ProofGen("A")})
 	f.states["A"] = runtime.StateStopped
 	s.OnUnloadDone(UnloadDone{IDs: []string{"A"}})
 	f.states["B"] = runtime.StateReady
@@ -293,8 +296,16 @@ func TestServeDoneBackendActiveBlocksUnload(t *testing.T) {
 		t.Fatal("unload while backend active")
 	}
 	s.OnBackendDone(BackendDoneEvent{ModelID: "A"})
+	if len(f.unloads) != 0 {
+		t.Fatal("backend-done signal is not completion proof")
+	}
+	s.OnStatus(StatusEvent{ModelID: "A", Status: runtime.Status{ActiveRequests: 0}, Gen: s.ProofGen("A") - 1})
+	if len(f.unloads) != 0 {
+		t.Fatal("status from an older generation cleared the slot")
+	}
+	s.OnStatus(StatusEvent{ModelID: "A", Status: runtime.Status{ActiveRequests: 0}, Gen: s.ProofGen("A")})
 	if len(f.unloads) != 1 {
-		t.Fatalf("unloads after backend done=%v", f.unloads)
+		t.Fatalf("unloads after proved idle=%v", f.unloads)
 	}
 }
 
@@ -313,7 +324,7 @@ func TestReopenGateWhenBCanceledBeforeUnload(t *testing.T) {
 	}
 	s.OnServeDone(ServeDoneEvent{ModelID: "A"})
 	f.status["A"] = runtime.Status{ActiveRequests: 0}
-	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"]})
+	s.OnStatus(StatusEvent{ModelID: "A", Status: f.status["A"], Gen: s.ProofGen("A")})
 	if len(f.unloads) != 0 {
 		t.Fatal("unloaded after demand vanished")
 	}
@@ -383,6 +394,51 @@ func TestCancelGrantedReleasesPending(t *testing.T) {
 	s.OnCancelGranted(CancelGrantedEvent{ModelID: "A"})
 	if s.Pending("A") != 0 {
 		t.Fatalf("pending=%d", s.Pending("A"))
+	}
+}
+
+func TestBusyGateDrainExpiresBeforeUnload(t *testing.T) {
+	f := newFake(map[string]runtime.State{"A": runtime.StateReady, "B": runtime.StateStopped})
+	s := newSched(f)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.UseNow(func() time.Time { return now })
+	s.drain = time.Second
+	s.OnRequest(req(1, "A"))
+	s.OnProxyStart(ProxyStartEvent{ModelID: "A", OK: make(chan bool, 1)})
+	s.OnRequest(req(2, "B"))
+	if !s.GateClosed("A") {
+		t.Fatal("gate should close while A is in flight")
+	}
+	if len(f.unloads) != 0 {
+		t.Fatal("unload started while A was busy")
+	}
+	now = now.Add(time.Second)
+	s.OnRemind()
+	if len(f.unloads) != 0 {
+		t.Fatal("drain expiry started unload")
+	}
+	if len(f.grants) < 1 || f.grants[len(f.grants)-1].err != ErrDrainTimeout {
+		t.Fatalf("grants=%v", f.grants)
+	}
+	if s.GateClosed("A") {
+		t.Fatal("expired drain left the gate closed")
+	}
+}
+
+func TestDrainTimeoutIs504(t *testing.T) {
+	f := newFake(map[string]runtime.State{"A": runtime.StateReady, "B": runtime.StateStopped})
+	s := newSched(f)
+	s.OnRequest(req(1, "B"))
+	s.OnUnloadDone(UnloadDone{IDs: []string{"A"}, Err: ErrDrainTimeout})
+	if len(f.grants) != 1 || f.grants[0].err != ErrDrainTimeout {
+		t.Fatalf("grants=%v", f.grants)
+	}
+	if f.grants[0].err.(*Error).Status != 504 {
+		t.Fatalf("status=%d", f.grants[0].err.(*Error).Status)
+	}
+	s.OnRequest(req(2, "B"))
+	if len(f.unloads) != 2 {
+		t.Fatalf("drain timeout stuck the victim, unloads=%v", f.unloads)
 	}
 }
 

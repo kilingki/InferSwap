@@ -3,12 +3,18 @@ package scheduler
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/kilingki/InferSwap/internal/runtime"
 )
 
 type Swapper interface {
 	EvictionFor(target string, running []string) []string
+}
+
+// Decider is an optional Swapper that can refuse a load without naming a victim.
+type Decider interface {
+	Decide(target string, running []string) (evict []string, err error)
 }
 
 type Scheduler interface {
@@ -29,7 +35,8 @@ type Effects interface {
 	ModelState(modelID string) (runtime.State, bool)
 	RunningModels() map[string]runtime.State
 	LastStatus(modelID string) (runtime.Status, bool)
-	StartUnload(ids []string)
+	StartUnload(ids []string, deadline time.Time)
+	Remind(at time.Time)
 	StartLoad(modelID string)
 	GrantError(req HandlerReq, err error)
 	GrantServe(req HandlerReq, modelID string) bool
@@ -75,6 +82,7 @@ type StatusEvent struct {
 	ModelID string
 	Status  runtime.Status
 	Err     error
+	Gen     uint64
 }
 
 type BackendDoneEvent struct {

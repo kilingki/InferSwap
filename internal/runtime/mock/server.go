@@ -46,6 +46,7 @@ type Server struct {
 
 	loadCh   chan struct{}
 	unloadCh chan struct{}
+	lastPath string
 }
 
 type Option func(*Server)
@@ -93,6 +94,7 @@ func New(name string, opts ...Option) (*Server, error) {
 	publicMux.HandleFunc("/control/unload", s.handleUnload)
 	publicMux.HandleFunc("/control/status", s.handleStatus)
 	publicMux.HandleFunc("/v1/", s.handleInference)
+	publicMux.HandleFunc("/align", s.handleInference)
 
 	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -220,10 +222,25 @@ func (s *Server) SetEndpointAlive(v bool) {
 	s.mu.Unlock()
 }
 
+func (s *Server) LastPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastPath
+}
+
 func (s *Server) EndpointAlive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.endpointAlive
+}
+
+func (s *Server) ForceReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelState = StateReady
+	s.residency = ResidencyResident
+	s.active = 0
+	s.lastError = nil
 }
 
 func (s *Server) ForceUnloaded() {

@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -72,6 +75,78 @@ func TestExtractMissingModel(t *testing.T) {
 	if err != ErrNoModel {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+func TestQueryModelDoesNotReadBody(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/completions?model=qwen", errReader{})
+	r.ContentLength = 4
+	got, err := ExtractModelLimited(r, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "qwen" {
+		t.Fatalf("model=%s", got)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (errReader) Close() error             { return nil }
+
+func TestSpoolPreservesBodyOver32MiB(t *testing.T) {
+	pad := bytes.Repeat([]byte("a"), (32<<20)+8)
+	raw := append([]byte(`{"model":"qwen","prompt":"`), pad...)
+	raw = append(raw, []byte(`"}`)...)
+	r := httptest.NewRequest(http.MethodPost, "/v1/completions", bytes.NewReader(raw))
+	r.Header.Set("Content-Type", "application/json")
+	r.ContentLength = -1
+	got, err := ExtractModelLimited(r, int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "qwen" {
+		t.Fatalf("model=%s", got)
+	}
+	restored, err := ioReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, raw) {
+		t.Fatalf("len got=%d want=%d", len(restored), len(raw))
+	}
+	path := r.Body.(*spoolFile).path
+	if err := r.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("temp file remains: %v", err)
+	}
+}
+
+func TestChunkedOverLimitRemovesSpool(t *testing.T) {
+	before := spoolNames()
+	r := httptest.NewRequest(http.MethodPost, "/v1/completions", bytes.NewReader([]byte(`{"model":"qwen","prompt":"abcdef"}`)))
+	r.Header.Set("Content-Type", "application/json")
+	r.ContentLength = -1
+	_, err := ExtractModelLimited(r, 8)
+	if err != ErrBodyTooLarge {
+		t.Fatalf("err=%v", err)
+	}
+	for name := range spoolNames() {
+		if !before[name] {
+			t.Fatalf("temp file left behind: %s", name)
+		}
+	}
+}
+
+func spoolNames() map[string]bool {
+	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "inferswap-body-*"))
+	out := map[string]bool{}
+	for _, name := range matches {
+		out[name] = true
+	}
+	return out
 }
 
 func ioReadAll(r *http.Request) ([]byte, error) {

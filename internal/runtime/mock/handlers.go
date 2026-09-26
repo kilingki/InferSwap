@@ -267,11 +267,12 @@ func (s *Server) waitAndWriteUnload(w http.ResponseWriter, r *http.Request, wait
 }
 
 func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, "/v1/") {
+	if !strings.HasPrefix(r.URL.Path, "/v1/") && r.URL.Path != "/align" {
 		http.NotFound(w, r)
 		return
 	}
 	s.mu.Lock()
+	s.lastPath = r.URL.RequestURI()
 	if s.modelState != StateReady || s.residency != ResidencyResident {
 		s.mu.Unlock()
 		writeControlError(w, http.StatusServiceUnavailable, "not ready", "NOT_READY")
@@ -296,7 +297,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 
 	if persist && backend != nil {
 		if err := backend.Hit(r.Context()); err != nil {
-			go s.finishInference(nil)
+			go s.finishInference(backend)
 			return
 		}
 	}

@@ -18,6 +18,10 @@ drainTimeout: 180
 shutdownTimeout: 60
 maxQueueSize: 256
 preload: ["qwen3.8-27b"]
+gpu:
+  device: GPU-example
+  safetyMarginBytes: 0
+  maxObservationAge: 5
 
 models:
   qwen3.8-27b:
@@ -32,9 +36,27 @@ models:
       prepareTimeout: 90
       healthCheckTimeout: 120
       unloadTimeout: 30
+    resourceProfile:
+      profileId: example
+      loadPeakBytes: 1024
+      inferencePeakBytes: 2048
+      unloadedResidualBytes: 0
+      maxConcurrency: 2
+      limits:
+        note: schema
+    inferencePaths: ["/v1/chat/completions"]
+    maxBodyBytes: 33554432
   qwen-asr:
     baseURL: "http://127.0.0.1:8001"
     name: "Qwen ASR"
+    resourceProfile:
+      profileId: asr-example
+      loadPeakBytes: 1024
+      inferencePeakBytes: 1024
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+    inferencePaths: ["/v1/audio/transcriptions"]
+    maxBodyBytes: 67108864
 `
 
 func TestLoadValid(t *testing.T) {
@@ -65,6 +87,12 @@ func TestLoadValid(t *testing.T) {
 	}
 	if m.Prepare == nil || m.Prepare.Argv[0] != "/absolute/path/model-project/prepare-inferswap" {
 		t.Fatalf("prepare=%v", m.Prepare)
+	}
+	if cfg.GPU.Device != "GPU-example" || m.ResourceProfile.LoadPeakBytes != 1024 {
+		t.Fatalf("gpu=%+v profile=%+v", cfg.GPU, m.ResourceProfile)
+	}
+	if asr.MaxBodyBytes != 67108864 || !asr.AllowsPath("/v1/audio/transcriptions") {
+		t.Fatalf("asr body=%d paths=%v", asr.MaxBodyBytes, asr.InferencePaths)
 	}
 }
 
@@ -176,12 +204,36 @@ func TestLoadExampleFile(t *testing.T) {
 	}
 }
 
+func TestRejectResource(t *testing.T) {
+	mustReject(t, `
+gpu:
+  device: GPU-example
+models:
+  a:
+    baseURL: "http://127.0.0.1:1"
+`, "resourceProfile")
+	mustReject(t, strings.Replace(validYAML, "concurrencyLimit: 1", "concurrencyLimit: 3", 1), "exceeds maxConcurrency")
+	mustReject(t, strings.Replace(validYAML, "unloadedResidualBytes: 0", "unloadedResidualBytes: 99999", 1), "exceeds peak")
+	mustReject(t, strings.Replace(validYAML, `"/v1/chat/completions"`, `"/control/load"`, 1), "control path")
+	mustReject(t, strings.Replace(validYAML, "device: GPU-example", "device: \"\"", 1), "gpu.device")
+}
+
 func TestResolveCanonical(t *testing.T) {
 	cfg, err := Load([]byte(`
+gpu:
+  device: GPU-example
 models:
   a:
     baseURL: "http://127.0.0.1:1"
     aliases: [alpha]
+    resourceProfile:
+      profileId: p
+      loadPeakBytes: 1
+      inferencePeakBytes: 1
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+    inferencePaths: ["/v1/completions"]
+    maxBodyBytes: 10
 `))
 	if err != nil {
 		t.Fatal(err)

@@ -22,7 +22,10 @@ import (
 
 type readyReq struct {
 	respond chan error
+	timeout time.Duration
 }
+
+var errAdmissionRequired = errors.New("load refused without admission")
 
 type stopReq struct {
 	timeout time.Duration
@@ -64,6 +67,7 @@ type Client struct {
 
 	prepMu   sync.Mutex
 	prepBusy bool
+	loadGate func(context.Context) error
 }
 
 type ClientOptions struct {
@@ -115,6 +119,14 @@ func NewClient(parent context.Context, model config.Model, globals *config.Confi
 	return c
 }
 
+func (c *Client) ID() string { return c.id }
+
+func (c *Client) SetLoadGate(fn func(context.Context) error) {
+	c.prepMu.Lock()
+	c.loadGate = fn
+	c.prepMu.Unlock()
+}
+
 func (c *Client) State() State {
 	if s, ok := c.state.Load().(State); ok {
 		return s
@@ -145,8 +157,8 @@ func (c *Client) Reconcile(ctx context.Context) error {
 	}
 }
 
-func (c *Client) EnsureReady(ctx context.Context, _ time.Duration) error {
-	req := readyReq{respond: make(chan error, 1)}
+func (c *Client) EnsureReady(ctx context.Context, timeout time.Duration) error {
+	req := readyReq{respond: make(chan error, 1), timeout: timeout}
 	select {
 	case c.readyCh <- req:
 	case <-ctx.Done():
@@ -223,14 +235,14 @@ func (c *Client) run() {
 		waiters = nil
 	}
 
-	startOp := func() {
+	startOp := func(timeout time.Duration) {
 		setState(StateStarting)
 		gen := c.gen.Add(1)
 		ctx, cancel := context.WithCancel(context.Background())
 		opCancel = cancel
 		opDone = make(chan opResult, 1)
 		go func() {
-			opDone <- opResult{gen: gen, err: c.doEnsure(ctx)}
+			opDone <- opResult{gen: gen, err: c.doEnsure(ctx, timeout)}
 		}()
 	}
 
@@ -251,6 +263,9 @@ func (c *Client) run() {
 				continue
 			}
 			req.respond <- c.applyReconcile(req.ctx, setState)
+			if state == StateStarting && opDone == nil {
+				startOp(0)
+			}
 
 		case req := <-c.readyCh:
 			switch state {
@@ -262,7 +277,7 @@ func (c *Client) run() {
 				waiters = append(waiters, req)
 			default:
 				waiters = append(waiters, req)
-				startOp()
+				startOp(req.timeout)
 			}
 
 		case res := <-opDone:
@@ -312,7 +327,7 @@ func (c *Client) run() {
 	}
 }
 
-func (c *Client) doEnsure(ctx context.Context) error {
+func (c *Client) doEnsure(ctx context.Context, timeout time.Duration) error {
 	st, err := c.fetchStatus(ctx)
 	if isEndpointDown(err) {
 		if err := c.runPrepare(ctx); err != nil {
@@ -326,15 +341,23 @@ func (c *Client) doEnsure(ctx context.Context) error {
 		}
 		return err
 	}
-	return c.ensureFromStatus(ctx, st)
+	return c.ensureFromStatus(ctx, st, timeout)
 }
 
-func (c *Client) ensureFromStatus(ctx context.Context, st Status) error {
+func (c *Client) loadBudget(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return c.healthCheckTimeout
+}
+
+func (c *Client) ensureFromStatus(ctx context.Context, st Status, timeout time.Duration) error {
+	budget := c.loadBudget(timeout)
 	switch st.State {
 	case WireReady:
 		return nil
 	case WireLoading:
-		return c.waitReady(ctx, c.clock.Now().Add(c.healthCheckTimeout))
+		return c.waitReady(ctx, c.clock.Now().Add(budget))
 	case WireUnloading:
 		return fmt.Errorf("runtime is unloading")
 	case WireFailed:
@@ -346,7 +369,10 @@ func (c *Client) ensureFromStatus(ctx context.Context, st Status) error {
 	default:
 		return fmt.Errorf("remote state=%s; refusing to assume ready or stopped", st.State)
 	}
-	deadline := c.clock.Now().Add(c.healthCheckTimeout)
+	if err := c.waitLoadGate(ctx); err != nil {
+		return err
+	}
+	deadline := c.clock.Now().Add(budget)
 	st, err := c.postLoad(ctx, deadline)
 	if err != nil {
 		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
@@ -459,6 +485,16 @@ func (c *Client) doStop(timeout time.Duration) error {
 	return nil
 }
 
+func (c *Client) waitLoadGate(ctx context.Context) error {
+	c.prepMu.Lock()
+	fn := c.loadGate
+	c.prepMu.Unlock()
+	if fn == nil {
+		return errAdmissionRequired
+	}
+	return fn(ctx)
+}
+
 func (c *Client) postLoad(ctx context.Context, deadline time.Time) (Status, error) {
 	remaining := deadline.Sub(c.clock.Now())
 	if remaining <= 0 {
@@ -505,7 +541,7 @@ func (c *Client) postControl(ctx context.Context, path string, timeout time.Dura
 func (c *Client) waitReady(ctx context.Context, deadline time.Time) error {
 	for {
 		if !c.clock.Now().Before(deadline) {
-			return fmt.Errorf("ready check timed out after %s", c.healthCheckTimeout)
+			return fmt.Errorf("ready check timed out")
 		}
 		st, err := c.fetchStatus(ctx)
 		if err != nil {
