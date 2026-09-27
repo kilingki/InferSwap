@@ -16,7 +16,7 @@ Shutdown waits while a model still holds a local execution slot, until the earli
 
 Models are separate projects. InferSwap selects one only by `baseURL` and does not branch on engine name.
 
-`config.example.yaml` records a measurement on this host. `nvidia-smi -L` reports `NVIDIA GeForce RTX 3090`, UUID `GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978`, 24576 MiB. NVML reads that device's total, free, and used bytes. The configured peaks were not lowered to force a pass.
+`config.example.yaml` records a measurement on this host. `nvidia-smi -L` reports `NVIDIA GeForce RTX 3090`, 24576 MiB. NVML reads that device's total, free, and used bytes. The configured peaks were not lowered to force a pass.
 
 Measured on 2026-09-26 with host `nvidia-smi` total used. The example adds 1 GiB to the higher observed maximum and does not lower a peak that a later run did not exceed:
 
