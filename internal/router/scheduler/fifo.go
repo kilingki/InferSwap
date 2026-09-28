@@ -14,6 +14,8 @@ const (
 	phaseIdle phase = iota
 	phaseUnloading
 	phaseLoading
+	phaseRecover
+	phaseSample
 )
 
 type FIFO struct {
@@ -42,6 +44,22 @@ type FIFO struct {
 	swapTarget  string
 	swapEvict   []string
 	unloadBegan bool
+
+	tokenSeq      uint64
+	recoverToken  uint64
+	recoverOwner  uint64
+	recoverModel  string
+	statusOrder   []string
+	statusPos     int
+	needSample    map[string]bool
+	checked       map[string]bool
+	sawResources  bool
+	sawLifecycle  bool
+	skipRest      bool
+	inflightModel string
+	probeStarted  map[string]uint64
+	acceptLate    map[uint64]bool
+	seen          map[uint64]map[string]bool
 }
 
 func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
@@ -78,7 +96,12 @@ func NewFIFO(cfg *config.Config, planner Swapper, effects Effects) *FIFO {
 		gateAt:      map[string]time.Time{},
 		drain:       drain,
 		now:         time.Now,
-		unloadFail:  map[string]bool{},
+		unloadFail:   map[string]bool{},
+		needSample:   map[string]bool{},
+		checked:      map[string]bool{},
+		probeStarted: map[string]uint64{},
+		acceptLate:   map[uint64]bool{},
+		seen:         map[uint64]map[string]bool{},
 	}
 }
 
@@ -112,6 +135,7 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	for i, q := range s.queued {
 		if q.ID == req.ID {
 			s.queued = append(s.queued[:i], s.queued[i+1:]...)
+			s.dropOwner(req.ID)
 			s.tryDispatch()
 			return
 		}
@@ -122,6 +146,7 @@ func (s *FIFO) OnQueueTimeout(req HandlerReq) {
 	for i, q := range s.queued {
 		if q.ID == req.ID {
 			s.queued = append(s.queued[:i], s.queued[i+1:]...)
+			s.dropOwner(req.ID)
 			s.effects.GrantError(q, ErrQueueTimeout)
 			s.tryDispatch()
 			return
@@ -264,11 +289,14 @@ func (s *FIFO) OnShutdown(err error) {
 }
 
 func (s *FIFO) tryDispatch() {
-	s.reopenUnusedGates()
-	if len(s.queued) == 0 {
+	if s.phase == phaseRecover || s.phase == phaseSample {
 		return
 	}
-	if s.phase != phaseIdle {
+	if s.phase == phaseIdle && len(s.queued) > 0 && s.maybeRecover(s.queued[0]) {
+		return
+	}
+	s.reopenUnusedGates()
+	if len(s.queued) == 0 || s.phase != phaseIdle {
 		return
 	}
 	head := s.queued[0]
@@ -316,7 +344,7 @@ func (s *FIFO) tryDispatch() {
 				return
 			}
 		}
-		s.phase = phaseUnloading
+		s.setPhase(phaseUnloading)
 		s.swapTarget = head.Model
 		s.swapEvict = append([]string{}, evict...)
 		s.unloadBegan = true
@@ -331,7 +359,7 @@ func (s *FIFO) tryDispatch() {
 		s.tryDispatch()
 		return
 	}
-	s.phase = phaseLoading
+	s.setPhase(phaseLoading)
 	s.swapTarget = head.Model
 	s.effects.StartLoad(head.Model)
 }

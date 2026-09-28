@@ -1,48 +1,33 @@
 # InferSwap
 
-InferSwap is a single OpenAI-compatible inference backend for services that use several Deep Learning models. The caller picks a model and a request. InferSwap waits, admits the load against the configured GPU budget, and forwards the request. When the budget is short, it selects one other ready model, waits until that model is idle, unloads it, and tries again.
+InferSwap is a single inference proxy for services that use several models on one GPU. The caller names a model and sends a request. InferSwap waits, admits the load against the configured GPU budget, and forwards the request. When the budget is short, it selects one other ready model, waits until that model is idle, unloads it, and tries again.
 
 Load and unload are not caller APIs. The caller does not manage model lifecycle.
 
-InferSwap does not own runtime processes. Containers, dependencies, and real load/unload belong to each model project. InferSwap drives a project through `GET /control/status`, `POST /control/load`, and `POST /control/unload`. A model is ready when status reports `state=ready` and `residency=resident`.
+Three roles stay separate:
 
-## Status
+| Role | Responsibility |
+|---|---|
+| Caller | Which model, and the request body. InferSwap does not interpret the output. |
+| InferSwap | Queue, cancellation, order, and GPU admission. It does not own runtime processes and does not branch on engine name. |
+| Model project | Containers, dependencies, and the real load, unload, and inference. InferSwap drives it through the [control contract](#model-control-contract). |
 
-Routing, FIFO wait, cancellation, per-model concurrency, and GPU admission are implemented. A new load runs only when the latest sample of the configured GPU is fresh and `free` minus `safetyMarginBytes` covers the sum of holds. The target's hold is its configured peak, the larger of `loadPeakBytes` and `inferencePeakBytes`. A ready, starting, or stopping model holds that same peak. A stopped model holds `unloadedResidualBytes`. NVML does not attribute process bytes, so a hold is not reduced when that memory is already absent from free. A model whose state is unknown, failed, or shutdown has no residual bound. With no reservation, admission fails. With a reservation, that reservation stays in the sum, and the model is not an unload candidate, so a new load proceeds only when those current holds already fit. A failed or device-mismatched sample clears the previous sample immediately. A sample older than `gpu.maxObservationAge` is not fresh and also blocks a new load; that stored sample stays until a later observation replaces it. An existing reservation is kept.
+A model is ready when control status reports `state=ready` and `residency=resident`.
 
-If the target still cannot fit, InferSwap checks whether device total minus the safety margin could hold the target peak with every other model at its residual. That check fails when the bytes do not fit, and also when any other model is unknown, failed, or shutdown. The request is then HTTP 503 and no unload starts. When the check passes, InferSwap selects one other ready model, the one with the oldest last use. Unknown, starting, stopping, and failed models are not candidates. A ready model that still has local work is still the candidate: its gate closes and the drain deadline starts immediately, including while that work is in flight. Unload starts only after that local work is gone, then waits until status reports `active_requests=0` and the model is not loading or unloading. Drain expiry is HTTP 504 and does not start unload. After a confirmed unload, the next admission waits for a GPU sample taken after that unload and tries again, until the target fits or no ready candidate remains.
+## Requirements
 
-Shutdown waits while a model still holds a local execution slot, until the earlier of `drainTimeout` and the shutdown context deadline, then unloads only a model that is idle on the same terms. `cmd/inferswap` passes one `shutdownTimeout` context to HTTP server shutdown and then to router shutdown, so an HTTP drain can consume the deadline before idle unload runs. A model that is still busy at that deadline, or whose state is unknown, failed, starting, or stopping, is reported unconfirmed and is not treated as released.
-
-Models are separate projects. InferSwap selects one only by `baseURL` and does not branch on engine name.
-
-`config.example.yaml` records a measurement on this host. `nvidia-smi -L` reports `NVIDIA GeForce RTX 3090`, 24576 MiB. NVML reads that device's total, free, and used bytes. The configured peaks were not lowered to force a pass.
-
-Measured on 2026-09-26 with host `nvidia-smi` total used. The example adds 1 GiB to the higher observed maximum and does not lower a peak that a later run did not exceed:
-
-| Model | Profile | Observed load | Observed inference | Residual | Configured peak |
-|---|---|---|---|---|---|
-| `qwen-asr` | `rtx3090-asr-2026-09-26` | 20011 MiB on 1s silence; 19583 MiB on 30min | 20015 MiB on 1s silence; 19682 MiB on 30min | 0 | 21039 MiB |
-| `qwen-fa` | `rtx3090-fa-2026-09-26` | 2793 MiB while loading | 5322 MiB | 0 | 6346 MiB |
-
-The 30min input was 16 kHz mono PCM16, 57,600,044 bytes, three load/inference/unload rounds, external concurrency 1. ASR split it into 120s chunks and the engine log showed `Running: 2 reqs` while control `active_requests` stayed 1. FA aligned the same WAV as ten 180s Korean chunks with batch 4. Each of those six requests returned HTTP 200. Unload returned to the host baseline near 1.0–1.1 GiB and did not grow, so residual 0 remains a measurement. The example registers only these two measured models. An unmeasured model left `unknown` still has no residual bound and blocks every new load.
-
-Admission uses those configured peaks plus `gpu.safetyMarginBytes` of 1 GiB. 21039 + 6346 + 1024 MiB is 28409 MiB, which does not fit in 24576 MiB. Coexistence was rejected: the two models were not both ready. On the InferSwap path the caller did not call load or unload. A short ASR transcription returned HTTP 200 and left FA unloaded. The following `POST /align?model=qwen-fa` returned HTTP 200 and left ASR unloaded. The 30min rounds did the same swap. A 33,603,052-byte WAV, above 32 MiB and under the 64 MiB `maxBodyBytes`, was forwarded and returned HTTP 200.
-
-Also observed on this GPU, not by replaying mocks:
-
-- Restart while ASR was resident reconstructed that model as ready and did not admit a second load as if the GPU were empty.
-- `healthCheckTimeout` of 2 seconds marked ASR `failed` while the runtime was still `loading`. A following FA request returned HTTP 503 and FA stayed unloaded. After the runtime later became ready, InferSwap still showed ASR failed and resident, and FA remained unloaded.
-- `unloadTimeout` of 1 second returned HTTP 502 `UNLOAD_FAILED` while ASR was still unloading and resident. The retry returned HTTP 503, and FA stayed unloaded.
-- A configured endpoint on a closed port stayed `unknown` and a FA request returned HTTP 503 without loading FA.
-- SIGTERM during an ASR load waited out `shutdownTimeout` (60 seconds) and exited 1 with `context deadline exceeded remaining=[qwen-asr]`. That was not recorded as a successful release.
-- An in-flight large transcription kept running in vLLM after InferSwap had exited, until the engine returned HTTP 200. A separate early client cancel has also been seen to drop ASR `active_requests` to 0. InferSwap does not force-cancel runtime work.
-
-`go test ./...` and `go test -race ./...` passed on 2026-09-26.
+- Go 1.25.3 or newer, as in `go.mod`
+- An NVIDIA GPU that NVML can read. `gpu.device` is that device's UUID
+- One model project per configured model, each implementing the control contract
 
 ## Quick start
 
-Requires Go 1.25.3 or newer, as in `go.mod`.
+`config.example.yaml` keeps the measured peaks from an RTX 3090 profile (ASR on `:8080`, FA on `:8090`, InferSwap on `:8095`). `gpu.device`, `prepare.argv`, and `measuredOn` in that file are placeholders. Before starting, set at least:
+
+- `gpu.device` to this machine's NVML UUID (`nvidia-smi -L`)
+- each `models.<id>.baseURL`
+- each `models.<id>.prepare.argv`, or omit `prepare` if the control endpoint is already up. `argv[0]` must be an absolute path
+- each `models.<id>.resourceProfile` from a measurement on this GPU. An unmeasured model left `unknown` blocks every new load. See [docs/measurements.md](docs/measurements.md)
 
 ```bash
 go test ./...
@@ -50,11 +35,11 @@ cp config.example.yaml config.yaml
 go run ./cmd/inferswap -config config.yaml
 ```
 
-On start, InferSwap reads the configured GPU, reconciles each model's control status, then loads ids listed in `preload` through the same admission path. Reconcile does not run `prepare`. When a load finds the control endpoint down and `prepare.argv` is set, that command runs. `argv[0]` must be an absolute path. The working directory is the directory of that executable, and the environment is inherited from InferSwap. While that child is still running, another prepare is not started.
+On start, InferSwap reads the configured GPU, reconciles each model's control status, then loads ids listed in `preload` through the same admission path. Reconcile does not run `prepare`. When a load finds the control endpoint down and `prepare.argv` is set, that command runs. The working directory is the directory of `argv[0]`, and the environment is inherited from InferSwap. While that child is still running, another prepare is not started.
 
 ## Configuration
 
-Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. `logLevel` is `debug`, `info`, `warn`, or `error` and sets the process slog level. The example listens on `:8095` so it can run beside ASR `:8080` and FA `:8090` on this host.
+Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. `logLevel` is `debug`, `info`, `warn`, or `error` and sets the process slog level.
 
 | Key | Role |
 |---|---|
@@ -69,7 +54,7 @@ Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `heal
 | `models.<id>.unlisted` | Omit the model from `GET /v1/models`. |
 | `models.<id>.prepare.argv` | Optional command when a load finds the control endpoint down. |
 | `models.<id>.resourceProfile` | Required measured load peak, inference peak, residual after unload, and the concurrency used for that measurement. |
-| `models.<id>.inferencePaths` | POST paths this model accepts. Control paths are rejected when the config is loaded. |
+| `models.<id>.inferencePath` | Exactly one internal path InferSwap forwards to after `POST /infer`. Empty, relative, `..`, query, and control paths are rejected when the config is loaded. `inferencePaths` is not accepted. |
 | `models.<id>.maxBodyBytes` | Maximum request body forwarded to the model. Required. |
 | `preload` | Model ids to load after reconcile, through the same admission path. |
 | `maxQueueSize` | Waiting requests before HTTP 429. |
@@ -85,21 +70,92 @@ Per-model `timeouts` may override only `prepareTimeout`, `healthCheckTimeout`, a
 
 ## API
 
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/embeddings`
-- `POST /v1/audio/transcriptions`
-- `POST /align?model=<id or alias>` — the `model` query selects the route and is removed before the body is forwarded to `/align`.
-- `GET /v1/models` — registered models. `unlisted: true` is omitted. The list includes `queue_depth` and `gpu` (`observed_at`, `fresh`, `total`, `free`). Each item includes `status.state`, `status.ready`, `status.residency`, `status.reason`, `status.reserved_bytes`, and `status.last_error`. For `unknown`, `ready` and `residency` are null.
-- `GET /health` — InferSwap process liveness. Model readiness is control status.
+Public inference is `POST /infer?model=<id or alias>` only. Any other path is HTTP 404. The model comes from the query. A missing or empty value is HTTP 400, and an unknown id or alias is HTTP 404. InferSwap removes that query before forwarding and rewrites the path to the selected model's `inferencePath`. Other query parameters and the body bytes are forwarded unchanged. Paths such as `/v1/audio/transcriptions` and `/align` stay inside the model process.
 
-`model` may be a canonical id or an alias, in JSON, `multipart/form-data`, or the query string. A body larger than that model's `maxBodyBytes` is rejected with HTTP 413. A path outside `inferencePaths` is HTTP 404. InferSwap errors are JSON with `error`, `src` (`inferswap`), and `code`.
+A body larger than that model's `maxBodyBytes` is HTTP 413. InferSwap errors are JSON:
 
-```bash
-curl -s http://127.0.0.1:8095/v1/audio/transcriptions \
-  -F 'file=@sample.wav;type=audio/wav' \
-  -F 'model=qwen3-asr' \
-  -F 'response_format=json'
+```json
+{"error": "gpu budget is not available", "src": "inferswap", "code": "RESOURCES"}
 ```
 
-Selected llama-swap provenance is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+| HTTP | `code` | When |
+|---|---|---|
+| 400 | `BAD_REQUEST` | Missing model query, or a body InferSwap must parse and cannot. |
+| 404 | `NOT_FOUND` | Unknown model, or any path other than the three public routes. |
+| 413 | `BODY_TOO_LARGE` | Body exceeds that model's `maxBodyBytes`. |
+| 429 | `QUEUE_FULL` | `maxQueueSize` waiting requests. `Retry-After: 1`. |
+| 502 | `LOAD_FAILED` | The control load did not reach ready. |
+| 502 | `UNLOAD_FAILED` | Unload failed. The next load stays blocked. |
+| 502 | `BACKEND` | A failure that has no more specific code. |
+| 503 | `RESOURCES` | The configured GPU budget cannot admit the target. |
+| 503 | `NOT_READY` | GPU observation is not ready, or the runtime is not ready to forward. |
+| 503 | `LIFECYCLE_PENDING` | A model lifecycle is still pending. |
+| 503 | `SHUTDOWN` | The router is shutting down. |
+| 504 | `QUEUE_TIMEOUT` | The request waited in the queue until `queueTimeout`. |
+| 504 | `DRAIN_TIMEOUT` | The selected model stayed busy until `drainTimeout`. Unload does not start. |
+
+- `GET /v1/models` lists registered models. `unlisted: true` is omitted. The list includes `queue_depth` and `gpu` (`observed_at`, `fresh`, `total`, `free`). Each item includes `status.state`, `status.ready`, `status.residency`, `status.reason`, `status.reserved_bytes`, and `status.last_error`. A successful live status also sets `status.remote_state`. For `unknown`, `ready` and `residency` are null. A failed status read does not replace a previous residency with `not_resident`.
+- `GET /health` is process liveness and returns HTTP 200 with an empty body. Model readiness is control status.
+
+```bash
+curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-asr' \
+  -F 'file=@canonical.wav;type=audio/wav' \
+  -F 'response_format=verbose_json' \
+  -F 'include_chunks=true' > asr.json
+
+curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-fa' \
+  -F 'file=@canonical.wav;type=audio/wav' \
+  -F 'payload=<asr.json' > alignment.json
+```
+
+The port and model ids above match `config.example.yaml`.
+
+## Model control contract
+
+InferSwap calls these routes on `models.<id>.baseURL`. Callers do not.
+
+| Method | Path | Body |
+|---|---|---|
+| `GET` | `/control/status` | none |
+| `POST` | `/control/load` | `{}` |
+| `POST` | `/control/unload` | `{}` |
+
+A successful status, load, or unload response is JSON with all four fields. `active_requests` is a non-negative integer. `last_error` is `null` or an object with `code` and `message`.
+
+```json
+{
+  "state": "ready",
+  "residency": "resident",
+  "active_requests": 0,
+  "last_error": null
+}
+```
+
+`state` is `unloaded`, `loading`, `ready`, `unloading`, or `failed`. `residency` is `resident`, `not_resident`, or `unknown`. `ready` requires `residency=resident`. `unloaded` requires `residency=not_resident` and `active_requests=0`. A successful unload response is that unloaded status.
+
+A non-200 control response uses this shape. InferSwap reads `error.code`, not the message.
+
+```json
+{"error": {"code": "BUSY", "message": "runtime has active inference requests"}}
+```
+
+## Limits
+
+- One configured GPU. Admission uses the configured peaks and the latest fresh NVML sample. NVML does not attribute process bytes, so a hold is not reduced when that memory is already absent from free.
+- Waiting requests stay in FIFO order. A later request does not pass an earlier one because its model is already ready.
+- A model whose state is unknown, failed, or shutdown has no residual bound. Without a reservation, a new load is refused.
+- Cancelling the HTTP client does not force-cancel work inside the model process.
+- InferSwap does not start containers except the optional `prepare.argv` when the control endpoint is down.
+
+The admission rules and the RTX 3090 measurements are in [docs/measurements.md](docs/measurements.md).
+
+## Development
+
+```bash
+go test ./...
+go test -race ./...
+```
+
+## License
+
+[MIT](LICENSE). Selected llama-swap provenance is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

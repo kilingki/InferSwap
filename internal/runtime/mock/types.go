@@ -53,6 +53,7 @@ type Counts struct {
 	UnloadEnds    int
 	InferStarts   int
 	InferEnds     int
+	StatusGets    int
 }
 
 type StatusMode int

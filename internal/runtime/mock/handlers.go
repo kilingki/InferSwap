@@ -1,8 +1,10 @@
 package mock
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -13,9 +15,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	s.counts.StatusGets++
 	mode := s.statusMode
 	st := s.statusLocked()
+	hold := s.statusHold
 	s.mu.Unlock()
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	switch mode {
 	case StatusMalformed:
 		w.Header().Set("Content-Type", "application/json")
@@ -271,8 +282,12 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	s.mu.Lock()
 	s.lastPath = r.URL.RequestURI()
+	s.lastBody = append([]byte(nil), body...)
+	s.lastType = r.Header.Get("Content-Type")
 	if s.modelState != StateReady || s.residency != ResidencyResident {
 		s.mu.Unlock()
 		writeControlError(w, http.StatusServiceUnavailable, "not ready", "NOT_READY")

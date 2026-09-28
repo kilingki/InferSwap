@@ -20,10 +20,13 @@ type GPUDiagnostics struct {
 }
 
 type ModelDiagnostics struct {
-	ReservedBytes int64
-	State         runtime.State
-	Reason        string
-	LastError     *runtime.LastError
+	ReservedBytes   int64
+	State           runtime.State
+	Reason          string
+	LastError       *runtime.LastError
+	RemoteKnown     bool
+	RemoteState     runtime.WireState
+	RemoteResidency runtime.Residency
 }
 
 func (r *Router) Diagnostics() Diagnostics {
@@ -44,9 +47,14 @@ func (r *Router) snapshotDiagnostics() Diagnostics {
 		if c, ok := rt.(*runtime.Client); ok {
 			item.Reason = c.StateReason()
 		}
-		if st, ok := r.lastStatus[id]; ok && st.LastError != nil {
-			cp := *st.LastError
-			item.LastError = &cp
+		if st, ok := r.lastStatus[id]; ok {
+			item.RemoteKnown = true
+			item.RemoteState = st.State
+			item.RemoteResidency = st.Residency
+			if st.LastError != nil {
+				cp := *st.LastError
+				item.LastError = &cp
+			}
 		}
 		models[id] = item
 	}

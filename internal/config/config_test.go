@@ -44,7 +44,7 @@ models:
       maxConcurrency: 2
       limits:
         note: schema
-    inferencePaths: ["/v1/chat/completions"]
+    inferencePath: /v1/chat/completions
     maxBodyBytes: 33554432
   qwen-asr:
     baseURL: "http://127.0.0.1:8001"
@@ -55,7 +55,7 @@ models:
       inferencePeakBytes: 1024
       unloadedResidualBytes: 0
       maxConcurrency: 1
-    inferencePaths: ["/v1/audio/transcriptions"]
+    inferencePath: /v1/audio/transcriptions
     maxBodyBytes: 67108864
 `
 
@@ -92,7 +92,7 @@ func TestLoadValid(t *testing.T) {
 		t.Fatalf("gpu=%+v profile=%+v", cfg.GPU, m.ResourceProfile)
 	}
 	if asr.MaxBodyBytes != 67108864 || !asr.AllowsPath("/v1/audio/transcriptions") {
-		t.Fatalf("asr body=%d paths=%v", asr.MaxBodyBytes, asr.InferencePaths)
+		t.Fatalf("asr body=%d path=%s", asr.MaxBodyBytes, asr.InferencePath)
 	}
 }
 
@@ -230,7 +230,13 @@ models:
 `, "resourceProfile")
 	mustReject(t, strings.Replace(validYAML, "concurrencyLimit: 1", "concurrencyLimit: 3", 1), "exceeds maxConcurrency")
 	mustReject(t, strings.Replace(validYAML, "unloadedResidualBytes: 0", "unloadedResidualBytes: 99999", 1), "exceeds peak")
-	mustReject(t, strings.Replace(validYAML, `"/v1/chat/completions"`, `"/control/load"`, 1), "control path")
+	mustReject(t, strings.Replace(validYAML, "/v1/chat/completions", "/control/load", 1), "control path")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePath: \"\"", 1), "inferencePath")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePath: align", 1), "not absolute")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePath: /a/../b", 1), "invalid")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePath: \"/v1/chat?x=1\"", 1), "invalid")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePaths: [\"/v1/chat/completions\"]", 1), "inferencePaths")
+	mustReject(t, strings.Replace(validYAML, "inferencePath: /v1/chat/completions", "inferencePath: /v1/chat/completions\n    inferencePaths: [\"/v1/chat/completions\"]", 1), "cannot both")
 	mustReject(t, strings.Replace(validYAML, "device: GPU-example", "device: \"\"", 1), "gpu.device")
 }
 
@@ -248,7 +254,7 @@ models:
       inferencePeakBytes: 1
       unloadedResidualBytes: 0
       maxConcurrency: 1
-    inferencePaths: ["/v1/completions"]
+    inferencePath: /v1/completions
     maxBodyBytes: 10
 `))
 	if err != nil {

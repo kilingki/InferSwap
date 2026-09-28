@@ -31,14 +31,14 @@ func newTestStack(t *testing.T, a, b *mock.Server) http.Handler {
 			"model-a": {
 				ID: "model-a", Name: "A", BaseURL: a.URL(), Aliases: []string{"alias-a"},
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
-				InferencePaths:  []string{"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/audio/transcriptions", "/align"},
+				InferencePath:    "/v1/audio/transcriptions",
 				MaxBodyBytes:    32 << 20,
 				ResourceProfile: config.ResourceProfile{ProfileID: "a", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
 			"model-b": {
 				ID: "model-b", Name: "B", BaseURL: b.URL(),
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second, Unlisted: true,
-				InferencePaths:  []string{"/v1/chat/completions", "/align"},
+				InferencePath:    "/align",
 				MaxBodyBytes:    32 << 20,
 				ResourceProfile: config.ResourceProfile{ProfileID: "b", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
@@ -78,12 +78,22 @@ func TestJSONRoutingAndInternalLoad(t *testing.T) {
 	defer b.Close()
 	h := newTestStack(t, a, b)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias-a","messages":[]}`))
+	payload := `{"model":"alias-a","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=alias-a", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
+	}
+	if a.LastPath() != "/v1/audio/transcriptions" {
+		t.Fatalf("path=%s", a.LastPath())
+	}
+	if string(a.LastBody()) != payload || a.LastContentType() != "application/json" {
+		t.Fatalf("body=%s type=%s", a.LastBody(), a.LastContentType())
+	}
+	if w.Header().Get("Content-Type") == "" || !bytes.Contains(w.Body.Bytes(), []byte("mock")) {
+		t.Fatalf("upstream response headers=%v body=%s", w.Header(), w.Body.Bytes())
 	}
 	if a.Counts().LoadStarts != 1 {
 		t.Fatalf("expected internal load, counts=%+v", a.Counts())
@@ -105,7 +115,7 @@ func TestUnknownModel404(t *testing.T) {
 	}
 	defer b.Close()
 	h := newTestStack(t, a, b)
-	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"nope"}`))
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=nope", strings.NewReader(`{"model":"nope"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -134,12 +144,19 @@ func TestMultipartRouting(t *testing.T) {
 	_, _ = fw.Write([]byte("RIFF"))
 	ct := mw.FormDataContentType()
 	_ = mw.Close()
-	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body.Bytes()))
+	raw := append([]byte(nil), body.Bytes()...)
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=model-a&keep=1", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", ct)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
+	}
+	if a.LastPath() != "/v1/audio/transcriptions?keep=1" {
+		t.Fatalf("path=%s", a.LastPath())
+	}
+	if !bytes.Equal(a.LastBody(), raw) || !strings.Contains(string(a.LastBody()), `name="model"`) {
+		t.Fatal("multipart body was rewritten")
 	}
 }
 
@@ -175,7 +192,7 @@ func TestModelsHidesUnlistedAndDistinguishesState(t *testing.T) {
 	if st["state"] == "unloaded" {
 		t.Fatal("local stopped must not be reported as unloaded")
 	}
-	if st["state"] != "stopped" || st["ready"] != false || st["residency"] != "not_resident" {
+	if st["state"] != "stopped" || st["ready"] != false || st["residency"] != "not_resident" || st["remote_state"] != "unloaded" {
 		t.Fatalf("status=%v", st)
 	}
 }
@@ -213,7 +230,7 @@ func TestAlignStripsModelQuery(t *testing.T) {
 	defer b.Close()
 	h := newTestStack(t, a, b)
 	body := []byte(`{"audio":"x"}`)
-	req := httptest.NewRequest(http.MethodPost, "/align?model=model-b&x=1", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=model-b&x=1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -240,7 +257,7 @@ func TestBodyLimit(t *testing.T) {
 	}
 	defer b.Close()
 	h := newTestStack(t, a, b)
-	req := httptest.NewRequest(http.MethodPost, "/v1/completions?model=alias-a", bytes.NewReader([]byte(`{"model":"alias-a"}`)))
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=alias-a", bytes.NewReader([]byte(`{"model":"alias-a"}`)))
 	req.ContentLength = 32<<20 + 1
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -262,11 +279,20 @@ func TestUnsupportedPath404(t *testing.T) {
 	}
 	defer b.Close()
 	h := newTestStack(t, a, b)
-	req := httptest.NewRequest(http.MethodPost, "/v1/other", strings.NewReader(`{}`))
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != 404 {
-		t.Fatalf("code=%d", w.Code)
+	for _, path := range []string{
+		"/v1/other",
+		"/v1/chat/completions",
+		"/v1/completions",
+		"/v1/embeddings",
+		"/v1/audio/transcriptions",
+		"/align",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 404 {
+			t.Fatalf("%s code=%d", path, w.Code)
+		}
 	}
 }
 
@@ -292,14 +318,14 @@ func TestModelsReportsQueueReservationAndError(t *testing.T) {
 			"model-a": {
 				ID: "model-a", Name: "A", BaseURL: a.URL(),
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
-				InferencePaths:  []string{"/v1/chat/completions"},
+				InferencePath:    "/v1/chat/completions",
 				MaxBodyBytes:    32 << 20,
 				ResourceProfile: config.ResourceProfile{ProfileID: "a", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
 			"model-b": {
 				ID: "model-b", Name: "B", BaseURL: b.URL(),
 				ConcurrencyLimit: 1, HealthCheckTimeout: 5 * time.Second, UnloadTimeout: 2 * time.Second,
-				InferencePaths:  []string{"/v1/chat/completions"},
+				InferencePath:    "/align",
 				MaxBodyBytes:    32 << 20,
 				ResourceProfile: config.ResourceProfile{ProfileID: "b", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
 			},
@@ -327,7 +353,7 @@ func TestModelsReportsQueueReservationAndError(t *testing.T) {
 	h := New(cfg, rt, runtimes).Handler()
 
 	go func() {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[]}`))
+		req := httptest.NewRequest(http.MethodPost, "/infer?model=model-a", strings.NewReader(`{"model":"model-a","messages":[]}`))
 		req.Header.Set("Content-Type", "application/json")
 		h.ServeHTTP(httptest.NewRecorder(), req)
 	}()
@@ -337,7 +363,7 @@ func TestModelsReportsQueueReservationAndError(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[]}`))
+		req := httptest.NewRequest(http.MethodPost, "/infer?model=model-a", strings.NewReader(`{"model":"model-a","messages":[]}`))
 		req.Header.Set("Content-Type", "application/json")
 		h.ServeHTTP(httptest.NewRecorder(), req)
 	}()
@@ -394,5 +420,154 @@ func TestModelsReportsQueueReservationAndError(t *testing.T) {
 	}
 	if !sawReserved || !sawError {
 		t.Fatalf("missing fields: %s", raw)
+	}
+}
+
+func TestInferQueryModelOnly(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	h := newTestStack(t, a, b)
+	for _, path := range []string{"/infer", "/infer?model=", "/infer?model=%20"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"alias-a"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s code=%d", path, w.Code)
+		}
+	}
+	if a.Counts().InferStarts != 0 {
+		t.Fatal("body model was used for routing")
+	}
+}
+
+func TestInferPreservesFAPayloadAndChunkedBody(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	h := newTestStack(t, a, b)
+	asr := []byte(`{"chunks":[{"index":0,"text":"안녕","start_sample":0,"end_sample":1}]}`)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "canonical.wav")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write([]byte("RIFF")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.WriteField("payload", string(asr)); err != nil {
+		t.Fatal(err)
+	}
+	ct := mw.FormDataContentType()
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := append([]byte(nil), buf.Bytes()...)
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=model-b", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
+	}
+	if b.LastPath() != "/align" || !bytes.Equal(b.LastBody(), raw) || !bytes.Contains(b.LastBody(), asr) {
+		t.Fatalf("path=%s body=%s", b.LastPath(), b.LastBody())
+	}
+	if !strings.Contains(b.LastContentType(), "multipart/form-data") {
+		t.Fatalf("type=%s", b.LastContentType())
+	}
+
+	chunk := []byte(`{"model":"in-body","n":1}`)
+	creq := httptest.NewRequest(http.MethodPost, "/infer?model=alias-a", bytes.NewReader(chunk))
+	creq.ContentLength = -1
+	creq.TransferEncoding = []string{"chunked"}
+	creq.Header.Set("Content-Type", "application/json")
+	cw := httptest.NewRecorder()
+	h.ServeHTTP(cw, creq)
+	if cw.Code != 200 || !bytes.Equal(a.LastBody(), chunk) || a.LastPath() != "/v1/audio/transcriptions" {
+		t.Fatalf("chunk code=%d path=%s body=%s", cw.Code, a.LastPath(), a.LastBody())
+	}
+}
+
+func TestInferStreamsMaxBytes(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	cfg := &config.Config{
+		MaxQueueSize: 4, QueueTimeout: time.Minute, StatusTimeout: time.Second,
+		Models: map[string]config.Model{
+			"model-a": {
+				ID: "model-a", BaseURL: a.URL(), ConcurrencyLimit: 1,
+				HealthCheckTimeout: time.Second, UnloadTimeout: time.Second,
+				InferencePath: "/v1/audio/transcriptions", MaxBodyBytes: 16,
+				ResourceProfile: config.ResourceProfile{ProfileID: "a", LoadPeakBytes: 10, InferencePeakBytes: 10, MaxConcurrency: 1},
+			},
+		},
+	}
+	c := runtime.NewClient(context.Background(), cfg.Models["model-a"], cfg, runtime.ClientOptions{})
+	rt := router.NewExclusive(cfg, map[string]runtime.Runtime{"model-a": c}, nil)
+	if err := rt.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = rt.Shutdown(ctx)
+		c.Shutdown()
+	})
+	h := New(cfg, rt, map[string]runtime.Runtime{"model-a": c}).Handler()
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=model-a", strings.NewReader(strings.Repeat("x", 64)))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.Bytes())
+	}
+}
+
+func TestInferCancelBeforeAdmit(t *testing.T) {
+	a, err := mock.New("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := mock.New("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	h := newTestStack(t, a, b)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/infer?model=alias-a", strings.NewReader(`{"model":"alias-a"}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if a.Counts().InferStarts != 0 || a.Counts().LoadStarts != 0 {
+		t.Fatalf("cancelled request reached the runtime: %+v", a.Counts())
 	}
 }

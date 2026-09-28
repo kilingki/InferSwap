@@ -12,8 +12,9 @@ maxQueueSize: 256
 preload: []
 
 gpu:
-  # This host: nvidia-smi -L → NVIDIA GeForce RTX 3090.
-  device: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
+  # Replace with this machine's NVML UUID (`nvidia-smi -L`).
+  # The peaks below were measured on an RTX 3090 and are not that UUID.
+  device: "GPU-00000000-0000-0000-0000-000000000000"
   safetyMarginBytes: 1073741824
   maxObservationAge: 5
 
@@ -23,7 +24,7 @@ models:
     name: "Qwen ASR"
     aliases: [qwen3-asr]
     prepare:
-      argv: ["/home/kjh/workspace/qwen-asr-vllm-docker-config/prepare-inferswap"]
+      argv: ["/path/to/qwen-asr-vllm-docker-config/prepare-inferswap"]
     resourceProfile:
       profileId: rtx3090-asr-2026-09-26
       # Host nvidia-smi total used. The cap is the higher of two 3-round runs, plus 1 GiB.
@@ -38,15 +39,14 @@ models:
       limits:
         input: "30min 16kHz mono PCM16 silence, 120s chunks, internal concurrency 2; cap kept from the higher 1s silence peak"
         rounds: 3
-        measuredOn: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
-    inferencePaths:
-      - /v1/audio/transcriptions
-    maxBodyBytes: 67108864
+        measuredOn: "GPU-00000000-0000-0000-0000-000000000000"
+    inferencePath: /v1/audio/transcriptions
+    maxBodyBytes: 1073741824
   qwen-fa:
     baseURL: "http://127.0.0.1:8090"
     name: "Qwen FA"
     prepare:
-      argv: ["/home/kjh/workspace/qwen-fa-docker-config/prepare-inferswap"]
+      argv: ["/path/to/qwen-fa-docker-config/prepare-inferswap"]
     resourceProfile:
       profileId: rtx3090-fa-2026-09-26
       # Host nvidia-smi total used. Three load/align/unload rounds of one 30min WAV.
@@ -61,7 +61,6 @@ models:
       limits:
         input: "30min 16kHz mono PCM16, ten 180s Korean chunks, batch 4"
         rounds: 3
-        measuredOn: "GPU-c47f1d0d-ea5d-4e6c-da7c-c9ad18b1b978"
-    inferencePaths:
-      - /align
-    maxBodyBytes: 67108864
+        measuredOn: "GPU-00000000-0000-0000-0000-000000000000"
+    inferencePath: /align
+    maxBodyBytes: 1073741824

@@ -25,6 +25,7 @@ var (
 	ErrUnloadBlocked = &Error{Status: http.StatusBadGateway, Code: "UNLOAD_FAILED", Msg: "unload failed; next load blocked"}
 	ErrShutdown      = &Error{Status: http.StatusServiceUnavailable, Code: "SHUTDOWN", Msg: "router is shutting down"}
 	ErrLoadFailed    = &Error{Status: http.StatusBadGateway, Code: "LOAD_FAILED", Msg: "load failed"}
-	ErrResources    = &Error{Status: http.StatusServiceUnavailable, Code: "RESOURCES", Msg: "gpu budget is not available"}
-	ErrNotBooted    = &Error{Status: http.StatusServiceUnavailable, Code: "NOT_READY", Msg: "gpu observation is not ready"}
+	ErrResources        = &Error{Status: http.StatusServiceUnavailable, Code: "RESOURCES", Msg: "gpu budget is not available"}
+	ErrNotBooted        = &Error{Status: http.StatusServiceUnavailable, Code: "NOT_READY", Msg: "gpu observation is not ready"}
+	ErrLifecyclePending = &Error{Status: http.StatusServiceUnavailable, Code: "LIFECYCLE_PENDING", Msg: "model lifecycle is still pending"}
 )

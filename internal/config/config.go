@@ -78,7 +78,7 @@ type rawModel struct {
 	Prepare          *rawPrepare    `yaml:"prepare"`
 	Timeouts         map[string]int `yaml:"timeouts"`
 	ResourceProfile  *rawProfile    `yaml:"resourceProfile"`
-	InferencePaths   []string       `yaml:"inferencePaths"`
+	InferencePath    *string        `yaml:"inferencePath"`
 	MaxBodyBytes     *int64         `yaml:"maxBodyBytes"`
 }
 
@@ -130,7 +130,7 @@ type Model struct {
 	HealthCheckTimeout time.Duration
 	UnloadTimeout      time.Duration
 	ResourceProfile    ResourceProfile
-	InferencePaths     []string
+	InferencePath      string
 	MaxBodyBytes       int64
 }
 
@@ -171,6 +171,14 @@ func Load(data []byte) (*Config, error) {
 			}
 			if err := rejectKeys(m, forbiddenModel, "model "+id); err != nil {
 				return nil, err
+			}
+			_, oldPaths := m["inferencePaths"]
+			_, newPath := m["inferencePath"]
+			if oldPaths && newPath {
+				return nil, fmt.Errorf("config: model %q: inferencePath and inferencePaths cannot both be set", id)
+			}
+			if oldPaths {
+				return nil, fmt.Errorf("config: model %q: inferencePaths is not supported; use inferencePath", id)
 			}
 			if timeouts, exists := m["timeouts"]; exists {
 				tm, ok := timeouts.(map[string]any)
@@ -279,12 +287,12 @@ func (raw rawFile) toConfig() (*Config, error) {
 	cfg.GPU = gpu
 	for id, m := range cfg.Models {
 		rm := raw.Models[id]
-		profile, paths, body, err := rm.resource(id, m.ConcurrencyLimit)
+		profile, path, body, err := rm.resource(id, m.ConcurrencyLimit)
 		if err != nil {
 			return nil, err
 		}
 		m.ResourceProfile = profile
-		m.InferencePaths = paths
+		m.InferencePath = path
 		m.MaxBodyBytes = body
 		cfg.Models[id] = m
 	}
@@ -309,62 +317,51 @@ func (raw *rawGPU) toGPU() (GPU, error) {
 	return GPU{Device: strings.TrimSpace(*raw.Device), SafetyMarginBytes: margin, MaxObservationAge: age}, nil
 }
 
-func (rm rawModel) resource(id string, concurrency int) (ResourceProfile, []string, int64, error) {
+func (rm rawModel) resource(id string, concurrency int) (ResourceProfile, string, int64, error) {
 	if rm.ResourceProfile == nil {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile is required", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: resourceProfile is required", id)
 	}
 	p := rm.ResourceProfile
 	if p.ProfileID == nil || strings.TrimSpace(*p.ProfileID) == "" {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile.profileId is required", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: resourceProfile.profileId is required", id)
 	}
 	load, err := nonNeg(id, "loadPeakBytes", p.LoadPeakBytes)
 	if err != nil {
-		return ResourceProfile{}, nil, 0, err
+		return ResourceProfile{}, "", 0, err
 	}
 	inf, err := nonNeg(id, "inferencePeakBytes", p.InferencePeakBytes)
 	if err != nil {
-		return ResourceProfile{}, nil, 0, err
+		return ResourceProfile{}, "", 0, err
 	}
 	residual, err := nonNeg(id, "unloadedResidualBytes", p.UnloadedResidualBytes)
 	if err != nil {
-		return ResourceProfile{}, nil, 0, err
+		return ResourceProfile{}, "", 0, err
 	}
 	peak := load
 	if inf > peak {
 		peak = inf
 	}
 	if residual > peak {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: unloadedResidualBytes exceeds peak", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: unloadedResidualBytes exceeds peak", id)
 	}
 	if p.MaxConcurrency == nil || *p.MaxConcurrency <= 0 {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: resourceProfile.maxConcurrency must be positive", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: resourceProfile.maxConcurrency must be positive", id)
 	}
 	if concurrency > *p.MaxConcurrency {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: concurrencyLimit exceeds maxConcurrency", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: concurrencyLimit exceeds maxConcurrency", id)
 	}
-	if len(rm.InferencePaths) == 0 {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inferencePaths is required", id)
+	if rm.InferencePath == nil || strings.TrimSpace(*rm.InferencePath) == "" {
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: inferencePath is required", id)
 	}
-	paths := make([]string, 0, len(rm.InferencePaths))
-	seen := map[string]struct{}{}
-	for _, path := range rm.InferencePaths {
-		if !strings.HasPrefix(path, "/") || strings.Contains(path, "?") {
-			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inference path %q is invalid", id, path)
-		}
-		if _, ok := controlPaths[path]; ok {
-			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: inference path %q is a control path", id, path)
-		}
-		if _, ok := seen[path]; ok {
-			return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: duplicate inference path %q", id, path)
-		}
-		seen[path] = struct{}{}
-		paths = append(paths, path)
+	path := *rm.InferencePath
+	if err := validateInferencePath(id, path); err != nil {
+		return ResourceProfile{}, "", 0, err
 	}
 	if rm.MaxBodyBytes == nil {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: maxBodyBytes is required", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: maxBodyBytes is required", id)
 	}
 	if *rm.MaxBodyBytes < 0 {
-		return ResourceProfile{}, nil, 0, fmt.Errorf("config: model %q: maxBodyBytes must not be negative", id)
+		return ResourceProfile{}, "", 0, fmt.Errorf("config: model %q: maxBodyBytes must not be negative", id)
 	}
 	limits := map[string]any{}
 	for k, v := range p.Limits {
@@ -377,7 +374,23 @@ func (rm rawModel) resource(id string, concurrency int) (ResourceProfile, []stri
 		UnloadedResidualBytes: residual,
 		MaxConcurrency:        *p.MaxConcurrency,
 		Limits:                limits,
-	}, paths, *rm.MaxBodyBytes, nil
+	}, path, *rm.MaxBodyBytes, nil
+}
+
+func validateInferencePath(id, path string) error {
+	if strings.TrimSpace(path) == "" || path != strings.TrimSpace(path) {
+		return fmt.Errorf("config: model %q: inferencePath is empty", id)
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("config: model %q: inferencePath %q is not absolute", id, path)
+	}
+	if strings.Contains(path, "..") || strings.Contains(path, "?") {
+		return fmt.Errorf("config: model %q: inferencePath %q is invalid", id, path)
+	}
+	if _, ok := controlPaths[path]; ok {
+		return fmt.Errorf("config: model %q: inference path %q is a control path", id, path)
+	}
+	return nil
 }
 
 func nonNeg(id, name string, v *int64) (int64, error) {
@@ -494,12 +507,7 @@ func (c *Config) Index() {
 }
 
 func (m Model) AllowsPath(path string) bool {
-	for _, p := range m.InferencePaths {
-		if p == path {
-			return true
-		}
-	}
-	return false
+	return m.InferencePath != "" && m.InferencePath == path
 }
 
 func (m Model) LoadBound() int64 {

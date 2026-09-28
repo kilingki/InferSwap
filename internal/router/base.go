@@ -58,6 +58,7 @@ type Router struct {
 	residualAfter  map[string]time.Time
 	unloadNoticeCh chan unloadNotice
 	syncCh         chan func()
+	recoverCh      chan recoverEvent
 }
 
 type admitReq struct {
@@ -120,6 +121,7 @@ func New(cfg *config.Config, runtimes map[string]runtime.Runtime, clock testkit.
 		residualAfter:   map[string]time.Time{},
 		unloadNoticeCh:  make(chan unloadNotice),
 		syncCh:          make(chan func()),
+		recoverCh:       make(chan recoverEvent),
 	}
 	r.schedule = scheduler.NewFIFO(cfg, r, r)
 	r.schedule.UseNow(r.clock.Now)
@@ -164,10 +166,7 @@ func (r *Router) run() {
 		case <-r.shutdownCtx.Done():
 			return
 		case done := <-r.shutdownCh:
-			r.schedule.OnShutdown(scheduler.ErrShutdown)
-			if done != nil {
-				close(done)
-			}
+			r.finishShutdown(done)
 		case req := <-r.handlerCh:
 			r.schedule.OnRequest(req)
 		case req := <-r.cancelCh:
@@ -208,6 +207,8 @@ func (r *Router) run() {
 			req.resp <- r.grantLoad(req.model)
 		case snap := <-r.observeCh:
 			r.applyObservation(snap)
+		case ev := <-r.recoverCh:
+			r.onRecover(ev)
 		case fn := <-r.syncCh:
 			fn()
 		}
@@ -234,15 +235,21 @@ func (r *Router) applyObservation(snap resource.Snapshot) {
 	if !snap.OK || snap.DeviceID != r.device {
 		r.snap = resource.Snapshot{}
 		r.bootGPU = false
+		r.schedule.SampleFailed()
 		return
 	}
 	r.snap = snap
 	r.bootGPU = true
+	var cleared []string
 	for id, at := range r.residualAfter {
 		if snap.ObservedAt.After(at) {
 			r.holdResidual(id)
 			delete(r.residualAfter, id)
+			cleared = append(cleared, id)
 		}
+	}
+	for _, id := range cleared {
+		r.schedule.MarkerCleared(id)
 	}
 }
 

@@ -61,11 +61,14 @@ type Client struct {
 	readyCh chan readyReq
 	stopCh  chan stopReq
 	reconCh chan reconReq
+	applyCh chan ApplyReq
 
-	state   atomic.Value
-	reason  atomic.Value
-	handler atomic.Pointer[http.Handler]
-	gen     atomic.Uint64
+	state    atomic.Value
+	reason   atomic.Value
+	handler  atomic.Pointer[http.Handler]
+	gen      atomic.Uint64
+	inflight atomic.Bool
+	remote   atomic.Value
 
 	prepMu   sync.Mutex
 	prepBusy bool
@@ -115,6 +118,7 @@ func NewClient(parent context.Context, model config.Model, globals *config.Confi
 		readyCh:            make(chan readyReq),
 		stopCh:             make(chan stopReq),
 		reconCh:            make(chan reconReq),
+		applyCh:            make(chan ApplyReq),
 	}
 	c.state.Store(StateUnknown)
 	c.reason.Store("")
@@ -123,6 +127,21 @@ func NewClient(parent context.Context, model config.Model, globals *config.Confi
 }
 
 func (c *Client) ID() string { return c.id }
+
+func (c *Client) Generation() uint64 { return c.gen.Load() }
+
+func (c *Client) LoadInFlight() bool { return c.inflight.Load() }
+
+func (c *Client) RecoveryReqs() chan ApplyReq { return c.applyCh }
+
+func (c *Client) RemoteDiag() RemoteDiag {
+	v := c.remote.Load()
+	if v == nil {
+		return RemoteDiag{}
+	}
+	d, _ := v.(RemoteDiag)
+	return d
+}
 
 func (c *Client) SetLoadGate(fn func(context.Context) error) {
 	c.prepMu.Lock()
@@ -257,6 +276,7 @@ func (c *Client) run() {
 		ctx, cancel := context.WithCancel(context.Background())
 		opCancel = cancel
 		opDone = make(chan opResult, 1)
+		c.inflight.Store(true)
 		go func() {
 			opDone <- opResult{gen: gen, err: c.doEnsure(ctx, timeout)}
 		}()
@@ -278,10 +298,30 @@ func (c *Client) run() {
 				req.respond <- ErrShutdown
 				continue
 			}
+			if opDone == nil {
+				c.gen.Add(1)
+			}
 			req.respond <- c.applyReconcile(req.ctx, setState)
 			if state == StateStarting && opDone == nil {
 				startOp(0)
 			}
+
+		case req := <-c.applyCh:
+			if state == StateShutdown {
+				req.Ack <- ApplyStale
+				continue
+			}
+			if opDone != nil {
+				req.Ack <- ApplyBusy
+				continue
+			}
+			if req.Cmd.Gen != c.gen.Load() {
+				req.Ack <- ApplyStale
+				continue
+			}
+			c.acceptApply(req.Cmd, setState)
+			c.gen.Add(1)
+			req.Ack <- ApplyApplied
 
 		case req := <-c.readyCh:
 			switch state {
@@ -302,6 +342,7 @@ func (c *Client) run() {
 			}
 			opCancel = nil
 			opDone = nil
+			c.inflight.Store(false)
 			if res.gen != c.gen.Load() {
 				continue
 			}
@@ -328,6 +369,9 @@ func (c *Client) run() {
 				<-opDone
 				opCancel = nil
 				opDone = nil
+				c.inflight.Store(false)
+			} else {
+				c.gen.Add(1)
 			}
 			setState(StateStopping, "unload")
 			err := c.doStop(req.timeout)
@@ -340,6 +384,29 @@ func (c *Client) run() {
 			notify(err)
 			req.respond <- err
 		}
+	}
+}
+
+func (c *Client) acceptApply(cmd ApplyCmd, setState func(State, string)) {
+	if cmd.HasStatus {
+		cp := cmd.Status
+		if cp.LastError != nil {
+			le := *cp.LastError
+			cp.LastError = &le
+		}
+		c.remote.Store(RemoteDiag{Known: true, Status: cp})
+	}
+	switch cmd.Class {
+	case RecReadyIdle:
+		c.installProxy()
+		setState(StateReady, "recovered")
+	case RecUnloadedIdle:
+		c.handler.Store(nil)
+		setState(StateStopped, "recovered_unloaded")
+	case RecFailedNotResidentIdle:
+		c.handler.Store(nil)
+		setState(StateStopped, "recovered_remote_failed")
+	default:
 	}
 }
 

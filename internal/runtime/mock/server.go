@@ -44,9 +44,12 @@ type Server struct {
 	lastError  *LastError
 	counts     Counts
 
-	loadCh   chan struct{}
-	unloadCh chan struct{}
-	lastPath string
+	loadCh     chan struct{}
+	unloadCh   chan struct{}
+	statusHold  chan struct{}
+	lastPath    string
+	lastBody    []byte
+	lastType    string
 }
 
 type Option func(*Server)
@@ -228,6 +231,18 @@ func (s *Server) LastPath() string {
 	return s.lastPath
 }
 
+func (s *Server) LastBody() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.lastBody...)
+}
+
+func (s *Server) LastContentType() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastType
+}
+
 func (s *Server) EndpointAlive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -259,6 +274,38 @@ func (s *Server) ForceFailed(res Residency) {
 	s.residency = res
 	s.active = 0
 	s.lastError = &LastError{Code: "LOAD_FAILED", Message: "injected"}
+}
+
+func (s *Server) SetWire(state WireState, res Residency, active int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelState = state
+	s.residency = res
+	s.active = active
+	if state == StateFailed && s.lastError == nil {
+		s.lastError = &LastError{Code: "LOAD_FAILED", Message: "injected"}
+	}
+	if state != StateFailed {
+		s.lastError = nil
+	}
+}
+
+func (s *Server) HoldStatus() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.statusHold == nil {
+		s.statusHold = make(chan struct{})
+	}
+}
+
+func (s *Server) ReleaseStatus() {
+	s.mu.Lock()
+	ch := s.statusHold
+	s.statusHold = nil
+	s.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
 func (s *Server) Prepare(ctx context.Context) error {

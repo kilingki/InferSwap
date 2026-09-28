@@ -132,6 +132,10 @@ func (r *Router) fitsIfRestResidual(target string) bool {
 			holds = append(holds, resource.Hold{ID: id, Bound: m.LoadBound()})
 			continue
 		}
+		if _, marked := r.residualAfter[id]; marked {
+			holds = append(holds, resource.Hold{ID: id, Bound: m.LoadBound()})
+			continue
+		}
 		st, ok := r.ModelState(id)
 		if !ok || st == runtime.StateUnknown || st == runtime.StateFailed || st == runtime.StateShutdown {
 			return false
@@ -198,6 +202,12 @@ func (r *Router) oldestResident(running []string, target string) string {
 
 func (r *Router) noteUse(id string) {
 	r.lastUse[id] = r.clock.Now()
+}
+
+func (r *Router) noteRecoveredReady(id string) {
+	if r.loadedAt[id].IsZero() && r.lastUse[id].IsZero() {
+		r.loadedAt[id] = r.clock.Now()
+	}
 }
 
 func (r *Router) noteLoaded(id string) {
