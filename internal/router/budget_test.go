@@ -284,6 +284,70 @@ func TestLowFreeStillEvictsWhenTotalCanHoldTarget(t *testing.T) {
 	}
 }
 
+func TestIdleGPUAdmitsWhenTotalHoldsPeak(t *testing.T) {
+	cfg := testRouterCfg()
+	cfg.GPU.Device = "fake"
+	cfg.GPU.MaxObservationAge = time.Minute
+	for _, id := range []string{"A", "B"} {
+		m := cfg.Models[id]
+		m.ResourceProfile = config.ResourceProfile{ProfileID: id, LoadPeakBytes: 80, InferencePeakBytes: 80, MaxConcurrency: 1}
+		cfg.Models[id] = m
+	}
+	rt := New(cfg, map[string]runtime.Runtime{
+		"A": &stubRT{state: runtime.StateStopped},
+		"B": &stubRT{state: runtime.StateStopped},
+	}, nil, resource.Generous("fake"))
+	defer shutdownRouter(t, rt)
+	var evict []string
+	var decideErr, admitErr error
+	rt.onLoop(func() {
+		rt.applyObservation(resource.Snapshot{DeviceID: "fake", Total: 100, Free: 20, Used: 80, ObservedAt: time.Now(), OK: true})
+		evict, decideErr = rt.Decide("B", []string{"A"})
+		admitErr = rt.grantLoad("B")
+	})
+	if decideErr != nil {
+		t.Fatal(decideErr)
+	}
+	if len(evict) != 0 {
+		t.Fatalf("evict=%v", evict)
+	}
+	if admitErr != nil {
+		t.Fatal(admitErr)
+	}
+}
+
+func TestReadyModelStillEvictedWhenFreeIsShort(t *testing.T) {
+	cfg := testRouterCfg()
+	cfg.GPU.Device = "fake"
+	cfg.GPU.MaxObservationAge = time.Minute
+	for _, id := range []string{"A", "B"} {
+		m := cfg.Models[id]
+		m.ResourceProfile = config.ResourceProfile{ProfileID: id, LoadPeakBytes: 80, InferencePeakBytes: 80, MaxConcurrency: 1}
+		cfg.Models[id] = m
+	}
+	rt := New(cfg, map[string]runtime.Runtime{
+		"A": &stubRT{state: runtime.StateReady},
+		"B": &stubRT{state: runtime.StateStopped},
+	}, nil, resource.Generous("fake"))
+	defer shutdownRouter(t, rt)
+	var evict []string
+	var decideErr, admitErr error
+	rt.onLoop(func() {
+		rt.applyObservation(resource.Snapshot{DeviceID: "fake", Total: 100, Free: 20, Used: 80, ObservedAt: time.Now(), OK: true})
+		evict, decideErr = rt.Decide("B", []string{"A"})
+		admitErr = rt.grantLoad("B")
+	})
+	if decideErr != nil {
+		t.Fatal(decideErr)
+	}
+	if len(evict) != 1 || evict[0] != "A" {
+		t.Fatalf("evict=%v", evict)
+	}
+	if admitErr == nil {
+		t.Fatal("admitted B while A is still ready and free is short")
+	}
+}
+
 func TestDrainTimeoutDoesNotUnload(t *testing.T) {
 	cfg := testRouterCfg()
 	cfg.GPU.Device = "fake"

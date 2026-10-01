@@ -14,15 +14,38 @@ Three roles stay separate:
 
 A model is ready when control status reports `state=ready` and `residency=resident`.
 
+The models in the example do not fit on one GPU together. The caller still names one model. InferSwap holds each configured peak against the latest GPU sample and unloads another ready model when that budget is short.
+
+```text
+Caller  -- POST /infer?model=... -->  InferSwap :8095
+                                         | queue, FIFO, GPU budget
+                                         v
+                              one model project (control + inference)
+```
+
 ## Requirements
 
 - Go 1.25.3 or newer, as in `go.mod`
 - An NVIDIA GPU that NVML can read. `gpu.device` is that device's UUID
-- One model project per configured model, each implementing the control contract
+- One model project per configured model, each implementing the control contract. [`config.example.yaml`](config.example.yaml) points at the three projects below. Another implementation can be registered under the same contract.
+
+## Example model projects
+
+`config.example.yaml` is the RTX 3090 profile for three separate model projects. Each one implements the control contract, serves inference on the same base URL, and provides `prepare-inferswap`. That command starts the container when the control endpoint is down. It does not load weights. InferSwap still sends `POST /control/load` and `POST /control/unload`.
+
+| Model id | Project | Port | `inferencePath` |
+|---|---|---|---|
+| `qwen-asr` | [qwen-asr-vllm-docker-config](https://github.com/kilingki/qwen-asr-vllm-docker-config) | `:8080` | `/v1/audio/transcriptions` |
+| `qwen-fa` | [qwen-fa-docker-config](https://github.com/kilingki/qwen-fa-docker-config) | `:8090` | `/align` |
+| `qwen-vlm` | [llama-cpp-docker-config](https://github.com/kilingki/llama-cpp-docker-config) | `:8000` | `/v1/chat/completions` |
+
+`qwen-asr` is Qwen3-ASR-1.7B in one vLLM container. `qwen-fa` is Qwen3-ForcedAligner-0.6B. Its align request is the same WAV plus the unmodified ASR JSON (`response_format=verbose_json`, `include_chunks=true`). `qwen-vlm` is the llama.cpp slot for the Qwen3.8-27B GGUF and its mmproj. Text chat and one image both use that id. `?model=qwen3.8-27b` is an alias of `qwen-vlm`. The JSON `"model"` field is forwarded unchanged and stays the llama-server name `qwen3.8-27b`.
+
+Docker, the NVIDIA Container Toolkit, and the weight files belong to those projects. The example peaks were measured with these three builds on one RTX 3090. The three models do not fit together. The numbers are in [docs/measurements.md](docs/measurements.md).
 
 ## Quick start
 
-`config.example.yaml` keeps the measured peaks from an RTX 3090 profile (ASR on `:8080`, FA on `:8090`, InferSwap on `:8095`). `gpu.device`, `prepare.argv`, and `measuredOn` in that file are placeholders. Before starting, set at least:
+This repository is the proxy. It does not start the model processes. Those containers come from the [example model projects](#example-model-projects). `config.example.yaml` keeps their measured RTX 3090 peaks, and InferSwap listens on `:8095`. `gpu.device`, `prepare.argv`, and `measuredOn` in that file are placeholders. Before starting, set at least:
 
 - `gpu.device` to this machine's NVML UUID (`nvidia-smi -L`)
 - each `models.<id>.baseURL`
@@ -30,7 +53,6 @@ A model is ready when control status reports `state=ready` and `residency=reside
 - each `models.<id>.resourceProfile` from a measurement on this GPU. An unmeasured model left `unknown` blocks every new load. See [docs/measurements.md](docs/measurements.md)
 
 ```bash
-go test ./...
 cp config.example.yaml config.yaml
 go run ./cmd/inferswap -config config.yaml
 ```
@@ -39,7 +61,29 @@ On start, InferSwap reads the configured GPU, reconciles each model's control st
 
 ## Configuration
 
-Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. `logLevel` is `debug`, `info`, `warn`, or `error` and sets the process slog level.
+Integer timeouts are seconds. When a key is omitted, the defaults are listen `:8080`, `logLevel` `info`, `healthCheckTimeout` 120, `unloadTimeout` 30, `queueTimeout` 180, `prepareTimeout` 60, `statusTimeout` 5, `drainTimeout` 180, `shutdownTimeout` 60, `maxQueueSize` 256, `concurrencyLimit` 1, `gpu.safetyMarginBytes` 0, `gpu.maxObservationAge` 5. [`config.example.yaml`](config.example.yaml) sets `listen` to `:8095` and `gpu.safetyMarginBytes` to 1 GiB. `logLevel` is `debug`, `info`, `warn`, or `error` and sets the process slog level.
+
+One model, with the measured peaks left in the example file:
+
+```yaml
+listen: ":8095"
+gpu:
+  device: "GPU-00000000-0000-0000-0000-000000000000"
+  safetyMarginBytes: 1073741824
+models:
+  qwen-asr:
+    baseURL: "http://127.0.0.1:8080"
+    prepare:
+      argv: ["/absolute/path/prepare-inferswap"]
+    resourceProfile:
+      profileId: measured-on-this-gpu
+      loadPeakBytes: 22060990464
+      inferencePeakBytes: 22060990464
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+    inferencePath: /v1/audio/transcriptions
+    maxBodyBytes: 1073741824
+```
 
 | Key | Role |
 |---|---|
@@ -53,7 +97,7 @@ Integer timeouts are seconds. Defaults: listen `:8080`, `logLevel` `info`, `heal
 | `models.<id>.concurrencyLimit` | In-flight requests allowed while that model is ready. Cannot exceed `resourceProfile.maxConcurrency`. |
 | `models.<id>.unlisted` | Omit the model from `GET /v1/models`. |
 | `models.<id>.prepare.argv` | Optional command when a load finds the control endpoint down. |
-| `models.<id>.resourceProfile` | Required measured load peak, inference peak, residual after unload, and the concurrency used for that measurement. |
+| `models.<id>.resourceProfile` | Required measured load peak, inference peak, residual after unload, and the concurrency used for that measurement. The byte fields are that host's `nvidia-smi` total used peaks, not per-process VRAM. |
 | `models.<id>.inferencePath` | Exactly one internal path InferSwap forwards to after `POST /infer`. Empty, relative, `..`, query, and control paths are rejected when the config is loaded. `inferencePaths` is not accepted. |
 | `models.<id>.maxBodyBytes` | Maximum request body forwarded to the model. Required. |
 | `preload` | Model ids to load after reconcile, through the same admission path. |
@@ -70,7 +114,26 @@ Per-model `timeouts` may override only `prepareTimeout`, `healthCheckTimeout`, a
 
 ## API
 
-Public inference is `POST /infer?model=<id or alias>` only. Any other path is HTTP 404. The model comes from the query. A missing or empty value is HTTP 400, and an unknown id or alias is HTTP 404. InferSwap removes that query before forwarding and rewrites the path to the selected model's `inferencePath`. Other query parameters and the body bytes are forwarded unchanged. Paths such as `/v1/audio/transcriptions` and `/align` stay inside the model process.
+Public routes are `POST /infer`, `GET /v1/models`, and `GET /health`. Any other path is HTTP 404.
+
+The example curls use the model project's own body. InferSwap forwards those bytes unchanged. The port and ids match `config.example.yaml`.
+
+```bash
+curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-asr' \
+  -F 'file=@canonical.wav;type=audio/wav' \
+  -F 'response_format=verbose_json' \
+  -F 'include_chunks=true' > asr.json
+
+curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-fa' \
+  -F 'file=@canonical.wav;type=audio/wav' \
+  -F 'payload=<asr.json' > alignment.json
+
+curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-vlm' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+`POST /infer?model=<id or alias>` is the only public inference route. The model comes from the query. A missing or empty value is HTTP 400, and an unknown id or alias is HTTP 404. InferSwap removes that query before forwarding and rewrites the path to the selected model's `inferencePath`. Other query parameters and the body bytes are forwarded unchanged. Paths such as `/v1/audio/transcriptions` and `/align` stay inside the model process.
 
 A body larger than that model's `maxBodyBytes` is HTTP 413. InferSwap errors are JSON:
 
@@ -81,7 +144,7 @@ A body larger than that model's `maxBodyBytes` is HTTP 413. InferSwap errors are
 | HTTP | `code` | When |
 |---|---|---|
 | 400 | `BAD_REQUEST` | Missing model query, or a body InferSwap must parse and cannot. |
-| 404 | `NOT_FOUND` | Unknown model, or any path other than the three public routes. |
+| 404 | `NOT_FOUND` | Unknown model, or any path other than `POST /infer`, `GET /v1/models`, and `GET /health`. |
 | 413 | `BODY_TOO_LARGE` | Body exceeds that model's `maxBodyBytes`. |
 | 429 | `QUEUE_FULL` | `maxQueueSize` waiting requests. `Retry-After: 1`. |
 | 502 | `LOAD_FAILED` | The control load did not reach ready. |
@@ -94,21 +157,43 @@ A body larger than that model's `maxBodyBytes` is HTTP 413. InferSwap errors are
 | 504 | `QUEUE_TIMEOUT` | The request waited in the queue until `queueTimeout`. |
 | 504 | `DRAIN_TIMEOUT` | The selected model stayed busy until `drainTimeout`. Unload does not start. |
 
-- `GET /v1/models` lists registered models. `unlisted: true` is omitted. The list includes `queue_depth` and `gpu` (`observed_at`, `fresh`, `total`, `free`). Each item includes `status.state`, `status.ready`, `status.residency`, `status.reason`, `status.reserved_bytes`, and `status.last_error`. A successful live status also sets `status.remote_state`. For `unknown`, `ready` and `residency` are null. A failed status read does not replace a previous residency with `not_resident`.
-- `GET /health` is process liveness and returns HTTP 200 with an empty body. Model readiness is control status.
+Text and one image on `qwen-vlm` use that same URL. An image request puts `image_url` content parts in the JSON body. InferSwap forwards those bytes unchanged.
 
-```bash
-curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-asr' \
-  -F 'file=@canonical.wav;type=audio/wav' \
-  -F 'response_format=verbose_json' \
-  -F 'include_chunks=true' > asr.json
+`GET /v1/models` lists registered models. `unlisted: true` is omitted.
 
-curl -fsS 'http://127.0.0.1:8095/infer?model=qwen-fa' \
-  -F 'file=@canonical.wav;type=audio/wav' \
-  -F 'payload=<asr.json' > alignment.json
+```json
+{
+  "object": "list",
+  "queue_depth": 0,
+  "gpu": {
+    "observed_at": "2026-10-01T00:00:00.000000000Z",
+    "fresh": true,
+    "total": 25769803776,
+    "free": 1073741824
+  },
+  "data": [
+    {
+      "id": "qwen-asr",
+      "object": "model",
+      "owned_by": "inferswap",
+      "name": "Qwen ASR",
+      "status": {
+        "state": "ready",
+        "ready": true,
+        "residency": "resident",
+        "reason": "",
+        "reserved_bytes": 22060990464,
+        "last_error": null,
+        "remote_state": "ready"
+      }
+    }
+  ]
+}
 ```
 
-The port and model ids above match `config.example.yaml`.
+For `unknown`, `ready` and `residency` are null. A failed status read does not replace a previous residency with `not_resident`. A successful live status sets `status.remote_state`.
+
+`GET /health` is process liveness and returns HTTP 200 with an empty body. Model readiness is control status.
 
 ## Model control contract
 
@@ -120,7 +205,7 @@ InferSwap calls these routes on `models.<id>.baseURL`. Callers do not.
 | `POST` | `/control/load` | `{}` |
 | `POST` | `/control/unload` | `{}` |
 
-A successful status, load, or unload response is JSON with all four fields. `active_requests` is a non-negative integer. `last_error` is `null` or an object with `code` and `message`.
+A successful status, load, or unload response is JSON with all four fields. `active_requests` is a non-negative integer. The model project counts it during inference. Drain waits until it is 0 before unload starts. `last_error` is `null` or an object with `code` and `message`.
 
 ```json
 {
@@ -145,7 +230,7 @@ A non-200 control response uses this shape. InferSwap reads `error.code`, not th
 - Waiting requests stay in FIFO order. A later request does not pass an earlier one because its model is already ready.
 - A model whose state is unknown, failed, or shutdown has no residual bound. Without a reservation, a new load is refused.
 - Cancelling the HTTP client does not force-cancel work inside the model process.
-- InferSwap does not start containers except the optional `prepare.argv` when the control endpoint is down.
+- InferSwap does not invoke `docker`. The optional `prepare.argv` may run a command that starts containers with Compose when the control endpoint is down.
 
 The admission rules and the RTX 3090 measurements are in [docs/measurements.md](docs/measurements.md).
 
@@ -156,6 +241,8 @@ go test ./...
 go test -race ./...
 ```
 
+`tests/*.py` attach to an already running InferSwap and the three model projects. They do not start those processes.
+
 ## License
 
-[MIT](LICENSE). Selected llama-swap provenance is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). Selected concurrency behavior is adapted from llama-swap. GPU admission, exclusive unload, and this config schema are InferSwap's. Provenance is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

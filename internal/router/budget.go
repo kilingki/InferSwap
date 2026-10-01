@@ -28,7 +28,7 @@ func (r *Router) Decide(target string, running []string) ([]string, error) {
 	if !r.gpuFresh() {
 		return nil, scheduler.ErrNotBooted
 	}
-	if r.fits(target) {
+	if r.admitWithoutEvict(target) {
 		return nil, nil
 	}
 	if !r.fitsIfRestResidual(target) {
@@ -79,7 +79,7 @@ func (r *Router) admitLoad(id string) error {
 	if r.loadSerial != "" && r.loadSerial != id {
 		return scheduler.ErrResources
 	}
-	if !r.fits(id) {
+	if !r.admitWithoutEvict(id) {
 		return scheduler.ErrResources
 	}
 	m, ok := r.cfg.Models[id]
@@ -110,6 +110,33 @@ func (r *Router) margin() int64 {
 		return 0
 	}
 	return r.cfg.GPU.SafetyMarginBytes
+}
+
+func (r *Router) admitWithoutEvict(target string) bool {
+	if r.fits(target) {
+		return true
+	}
+	return r.fitsIfRestResidual(target) && r.othersAtResidual(target)
+}
+
+func (r *Router) othersAtResidual(target string) bool {
+	for id, m := range r.cfg.Models {
+		if id == target {
+			continue
+		}
+		if _, marked := r.residualAfter[id]; marked {
+			return false
+		}
+		hold, ok := r.boundFor(id, m, false)
+		if !ok || hold != m.ResourceProfile.UnloadedResidualBytes {
+			return false
+		}
+		st, ok := r.ModelState(id)
+		if !ok || st != runtime.StateStopped {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Router) fits(target string) bool {

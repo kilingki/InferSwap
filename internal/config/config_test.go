@@ -17,16 +17,16 @@ statusTimeout: 5
 drainTimeout: 180
 shutdownTimeout: 60
 maxQueueSize: 256
-preload: ["qwen3.8-27b"]
+preload: ["qwen-vlm"]
 gpu:
   device: GPU-example
   safetyMarginBytes: 0
   maxObservationAge: 5
 
 models:
-  qwen3.8-27b:
+  qwen-vlm:
     baseURL: "http://127.0.0.1:8000"
-    name: "Qwen3.8 27B"
+    name: "Qwen VLM"
     aliases: [qwen]
     concurrencyLimit: 1
     unlisted: false
@@ -65,7 +65,7 @@ func TestLoadValid(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, ok := cfg.Resolve("qwen")
-	if !ok || id != "qwen3.8-27b" {
+	if !ok || id != "qwen-vlm" {
 		t.Fatalf("Resolve(qwen)=%q ok=%v", id, ok)
 	}
 	m, ok := cfg.Model("qwen")
@@ -208,10 +208,16 @@ func TestLoadExampleFile(t *testing.T) {
 	if _, ok := cfg.Resolve("qwen"); ok {
 		t.Fatal("unmeasured alias qwen must not resolve")
 	}
-	if _, ok := cfg.Resolve("qwen3.8-27b"); ok {
-		t.Fatal("unmeasured model qwen3.8-27b must not resolve")
+	if id, ok := cfg.Resolve("qwen3.8-27b"); !ok || id != "qwen-vlm" {
+		t.Fatalf("Resolve(qwen3.8-27b)=%q ok=%v", id, ok)
 	}
-	if len(cfg.Models) != 2 {
+	if id, ok := cfg.Resolve("qwen-vlm"); !ok || id != "qwen-vlm" {
+		t.Fatalf("Resolve(qwen-vlm)=%q ok=%v", id, ok)
+	}
+	if cfg.Models["qwen-vlm"].InferencePath != "/v1/chat/completions" {
+		t.Fatalf("qwen-vlm path %q", cfg.Models["qwen-vlm"].InferencePath)
+	}
+	if len(cfg.Models) != 3 {
 		t.Fatalf("example models=%d", len(cfg.Models))
 	}
 }

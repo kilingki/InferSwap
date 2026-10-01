@@ -64,3 +64,27 @@ models:
         measuredOn: "GPU-00000000-0000-0000-0000-000000000000"
     inferencePath: /align
     maxBodyBytes: 1073741824
+  qwen-vlm:
+    baseURL: "http://127.0.0.1:8000"
+    name: "Qwen VLM"
+    aliases: [qwen3.8-27b]
+    prepare:
+      argv: ["/path/to/llama-cpp-docker-config/prepare-inferswap"]
+    resourceProfile:
+      profileId: rtx3090-qwen38-2026-10-01
+      # Host nvidia-smi total used. Three load/infer/unload rounds.
+      # Text chat floor, not used as the cap: load 20693 MiB, inference 20708 MiB.
+      # One JPEG, local/test-cat.jpg, 279603 bytes: load 21373 MiB, inference 21547 MiB.
+      # The image peak was higher, so the cap is that inference max plus 1 GiB.
+      # Unload returned to the host baseline and did not grow, so residual 0 is measured.
+      # This is one still image, not a multi-frame video budget.
+      loadPeakBytes: 23667408896
+      inferencePeakBytes: 23667408896
+      unloadedResidualBytes: 0
+      maxConcurrency: 1
+      limits:
+        input: "test-cat.jpg 279603 bytes, one image_url, max_tokens 256; text floor was a short chat and was lower"
+        rounds: 3
+        measuredOn: "GPU-00000000-0000-0000-0000-000000000000"
+    inferencePath: /v1/chat/completions
+    maxBodyBytes: 1073741824
