@@ -1,5 +1,7 @@
 local/
 tests/outputs/
 config.yaml
+config.vllm.yaml
 __pycache__/
 *.pyc
+.venv/

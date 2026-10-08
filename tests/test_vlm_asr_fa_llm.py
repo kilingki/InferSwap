@@ -3,9 +3,10 @@
 
 Attaches to InferSwap and the three runtimes. Does not start them and does
 not call control load or unload. VLM and LLM share the InferSwap id qwen-vlm.
-The JSON model field stays the llama-server name qwen3.8-27b. ASR and
-FA use one YouTube WAV. Host memory samples in the report are observations,
-not a resourceProfile.
+The JSON model field stays the served name qwen3.8-27b. The control default
+is the vLLM runtime on :8010. The previous runtime was llama.cpp on :8000.
+ASR and FA use one YouTube WAV. Host memory samples in the report are
+observations, not a resourceProfile.
 
 Writes tests/outputs/vlm_asr_fa_llm-<timestamp>.json and does not overwrite it.
 """
@@ -24,7 +25,8 @@ import test_asr_fa_swap as asr_fa
 
 YOUTUBE_URL = asr_fa.YOUTUBE_URL
 INFER_BASE_URL = live.read_env("INFER_BASE_URL", "http://127.0.0.1:8095").rstrip("/")
-LLAMA_BASE = live.read_env("LLAMA_BASE", "http://127.0.0.1:8000").rstrip("/")
+# llama-cpp-docker-config: http://127.0.0.1:8000
+LLAMA_BASE = live.read_env("LLAMA_BASE", "http://127.0.0.1:8010").rstrip("/")
 ASR_BASE = live.read_env("ASR_BASE", "http://127.0.0.1:8080").rstrip("/")
 FA_BASE = live.read_env("FA_BASE", "http://127.0.0.1:8090").rstrip("/")
 VLM_ID = "qwen-vlm"
@@ -35,7 +37,8 @@ REQUEST_TIMEOUT_SECONDS = int(live.read_env("STT_REQUEST_TIMEOUT_SECONDS", "7200
 IMAGE_FILE = Path(
     live.read_env(
         "IMAGE_FILE",
-        "/home/kjh/workspace/llama-cpp-docker-config/local/test-cat.jpg",
+        # llama-cpp-docker-config: /home/kjh/workspace/llama-cpp-docker-config/local/test-cat.jpg
+        "/home/kjh/workspace/vllm-docker-config/tests/test-cat.jpg",
     )
 )
 LLM_PROMPT = "Reply with the single word: pong"
