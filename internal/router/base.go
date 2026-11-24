@@ -199,6 +199,12 @@ func (r *Router) run() {
 				r.lastStatus[ev.ModelID] = ev.Status
 			}
 			r.schedule.OnStatus(ev)
+			// An HTTP response/disconnect can precede asynchronous backend cleanup.
+			// Keep the same quiet generation under observation until it is idle.
+			if ev.Gen != 0 && ev.Gen == r.schedule.ProofGen(ev.ModelID) &&
+				(ev.Err != nil || ev.Status.ActiveRequests > 0) {
+				go r.refreshStatusAfter(ev.ModelID, ev.Gen)
+			}
 		case ev := <-r.backendDoneCh:
 			r.schedule.OnBackendDone(ev)
 		case req := <-r.timeoutCh:
@@ -278,6 +284,21 @@ func (r *Router) refreshStatus(id string, gen uint64) {
 	select {
 	case r.statusCh <- scheduler.StatusEvent{ModelID: id, Status: st, Err: err, Gen: gen}:
 	case <-r.shutdownCtx.Done():
+	}
+}
+
+func (r *Router) refreshStatusAfter(id string, gen uint64) {
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-r.shutdownCtx.Done():
+		return
+	}
+	current := false
+	r.onLoop(func() { current = r.schedule.ProofGen(id) == gen })
+	if current {
+		r.refreshStatus(id, gen)
 	}
 }
 
